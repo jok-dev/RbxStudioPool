@@ -1,0 +1,4 @@
+# Log lines that are not the game's: noise from Studio plugins installed on this machine. One regex per line.
+# `rsp logs` hides these unless --all; `wait-log` does not stop on errors matching them.
+^RoMixamo
+rbxassetid://203785492

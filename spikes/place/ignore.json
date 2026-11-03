@@ -1,0 +1,8 @@
+{
+	"paths": [],
+	"properties": [
+		{ "class": "BasePart", "property": "Position", "reason": "derived from CFrame" },
+		{ "class": "BasePart", "property": "Orientation", "reason": "derived from CFrame" },
+		{ "class": "BasePart", "property": "Rotation", "reason": "derived from CFrame" }
+	]
+}

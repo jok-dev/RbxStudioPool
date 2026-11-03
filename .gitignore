@@ -1,0 +1,9 @@
+.superpowers/
+target/
+state/
+snapshots/
+*.rbxl
+*.rbxl.lock
+sourcemap.json
+roblox.yml
+__pycache__/

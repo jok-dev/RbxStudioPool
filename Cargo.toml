@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "spikes/studio-slots"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+publish = false
+license = "UNLICENSED"
+
+[workspace.dependencies]
+process-tree = { path = "crates/process-tree" }
+rbx-studio-pool = { path = "crates/rbx-studio-pool" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "net"] }
+rmcp = { version = "3.8", default-features = false, features = ["macros", "server", "client", "transport-io", "transport-child-process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+process-wrap = { version = "10", features = ["tokio1", "job-object", "process-group", "kill-on-drop"] }
+windows-sys = "0.61"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

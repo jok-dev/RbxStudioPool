@@ -1,0 +1,179 @@
+diff --git a/plugin/src/App/init.lua b/plugin/src/App/init.lua
+index e6e4dee..afff10a 100644
+--- a/plugin/src/App/init.lua
++++ b/plugin/src/App/init.lua
+@@ -25,6 +25,7 @@ local preloadAssets = require(Plugin.preloadAssets)
+ local soundPlayer = require(Plugin.soundPlayer)
+ local ignorePlaceIds = require(Plugin.ignorePlaceIds)
+ local timeUtil = require(Plugin.timeUtil)
++local RojoControl = require(Plugin.RojoControl)
+ local Theme = require(script.Theme)
+ 
+ local Page = require(script.Page)
+@@ -156,6 +157,11 @@ function App:init()
+ 		end)
+ 	end
+ 
++	-- Edit, and the Play server so changes reach a running playtest; never the Play client
++	if RunService:IsEdit() or (RunService:IsRunning() and RunService:IsServer()) then
++		RojoControl.start(self)
++	end
++
+ 	if self:isAutoConnectPlaytestServerAvailable() then
+ 		self:useRunningConnectionInfo()
+ 		self:startSession()
+@@ -629,6 +635,7 @@ function App:startSession()
+ 	local serveSession = ServeSession.new({
+ 		apiContext = apiContext,
+ 		twoWaySync = Settings:get("twoWaySync"),
++		startPaused = self.rojoControlStartPaused == true,
+ 	})
+ 
+ 	serveSession:setUpdateLoadingTextCallback(function(text: string)
+@@ -744,6 +751,10 @@ function App:startSession()
+ 			return "Accept"
+ 		end
+ 
++		if self.rojoControlSession then
++			return "Accept"
++		end
++
+ 		-- Play solo auto-connect does not require confirmation
+ 		if self:isAutoConnectPlaytestServerAvailable() then
+ 			Log.trace("Accepting patch without confirmation because play solo auto-connect is enabled")
+diff --git a/plugin/src/ServeSession.lua b/plugin/src/ServeSession.lua
+index 7e9fc74..c26ba6a 100644
+--- a/plugin/src/ServeSession.lua
++++ b/plugin/src/ServeSession.lua
+@@ -63,8 +63,18 @@ ServeSession.Status = Status
+ local validateServeOptions = t.strictInterface({
+ 	apiContext = t.table,
+ 	twoWaySync = t.boolean,
++	-- RojoControl fork: start without applying anything; changes count as pending until syncOnce or setLive(true)
++	startPaused = t.optional(t.boolean),
+ })
+ 
++local function patchSize(patch)
++	local size = #patch.removed + #patch.updated
++	for _ in patch.added do
++		size += 1
++	end
++	return size
++end
++
+ function ServeSession.new(options)
+ 	assert(validateServeOptions(options))
+ 
+@@ -109,6 +119,10 @@ function ServeSession.new(options)
+ 		__precommitCallbacks = {},
+ 		__postcommitCallbacks = {},
+ 		__updateLoadingText = function() end,
++		__live = not options.startPaused,
++		__pending = 0,
++		__lastSync = nil,
++		__rootId = nil,
+ 	}
+ 
+ 	setmetatable(self, ServeSession)
+@@ -135,6 +149,39 @@ function ServeSession:onStatusChanged(callback)
+ 	self.__statusChangedCallback = callback
+ end
+ 
++-- RojoControl fork: live/paused state, pending change count, sync once.
++function ServeSession:getSyncState()
++	return { live = self.__live, pending = self.__pending, lastSync = self.__lastSync }
++end
++
++function ServeSession:setLive(live: boolean)
++	self.__live = live
++	if live and self.__pending > 0 then
++		return self:syncOnce()
++	end
++	return Promise.resolve()
++end
++
++-- Re-reads the whole tree and applies the difference, like the initial sync without the confirmation step.
++-- More robust than replaying queued messages, since Studio may have changed in between.
++function ServeSession:syncOnce()
++	if self.__status ~= Status.Connected then
++		return Promise.reject("Not connected")
++	end
++
++	return self.__apiContext:read({ self.__rootId }):andThen(function(readResponseBody)
++		self.__apiContext:setMessageCursor(readResponseBody.messageCursor)
++		self.__reconciler:hydrate(readResponseBody.instances, self.__rootId, game)
++		local success, patch = self.__reconciler:diff(readResponseBody.instances, self.__rootId, game)
++		if not success then
++			return Promise.reject(patch)
++		end
++		self:__applyPatch(patch)
++		self.__pending = 0
++		self.__lastSync = os.time()
++	end)
++end
++
+ function ServeSession:setConfirmCallback(callback)
+ 	self.__userConfirmCallback = callback
+ end
+@@ -210,9 +257,18 @@ function ServeSession:start()
+ 
+ 						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
+ 
++						if not self.__live then
++							for _, message in messagesPacket.messages do
++								self.__pending += patchSize(message)
++							end
++							self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
++							return
++						end
++
+ 						for _, message in messagesPacket.messages do
+ 							self:__applyPatch(message)
+ 						end
++						self.__lastSync = os.time()
+ 						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
+ 					end,
+ 				})
+@@ -522,6 +578,12 @@ function ServeSession:__initialSync(serverInfo)
+ 
+ 		Log.trace("Computed hydration patch: {:#?}", debugPatch(catchUpPatch))
+ 
++		self.__rootId = serverInfo.rootInstanceId
++		if not self.__live then
++			self.__pending = patchSize(catchUpPatch)
++			return Promise.resolve()
++		end
++
+ 		local userDecision = "Accept"
+ 		if self.__userConfirmCallback ~= nil then
+ 			userDecision = self.__userConfirmCallback(self.__instanceMap, catchUpPatch, serverInfo)
+@@ -561,6 +623,7 @@ function ServeSession:__initialSync(serverInfo)
+ 			return self.__apiContext:write(inversePatch)
+ 		elseif userDecision == "Accept" then
+ 			self:__applyPatch(catchUpPatch)
++			self.__lastSync = os.time()
+ 			return Promise.resolve()
+ 		else
+ 			return Promise.reject("Invalid user decision: " .. userDecision)
+diff --git a/plugin/src/soundPlayer.lua b/plugin/src/soundPlayer.lua
+index 3259272..85450ac 100644
+--- a/plugin/src/soundPlayer.lua
++++ b/plugin/src/soundPlayer.lua
+@@ -12,6 +12,8 @@ end
+ 
+ local SoundPlayer = {}
+ SoundPlayer.__index = SoundPlayer
++-- ROJOCONTROL FORK: set by RojoControl while a session it started is running, so agents stay silent
++SoundPlayer.muted = false
+ 
+ function SoundPlayer.new(settings)
+ 	return setmetatable({
+@@ -20,7 +22,7 @@ function SoundPlayer.new(settings)
+ end
+ 
+ function SoundPlayer:play(soundId)
+-	if self.settings and self.settings:get("playSounds") == false then
++	if SoundPlayer.muted or (self.settings and self.settings:get("playSounds") == false) then
+ 		return
+ 	end
+ 

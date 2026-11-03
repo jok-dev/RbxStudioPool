@@ -1,0 +1,19 @@
+std = "lua53+roblox"
+
+[config.unused_variable]
+ignore_module_fields = [".Attributes", ".Tag"]
+
+[rules]
+# Allow ifs to have the same then else. This really doesn't matter.
+if_same_then_else = "allow"
+
+# Allow multiple statements in a single line
+multiple_statements = "allow"
+
+# Allow unused function parameters
+unused_function_parameter = "allow"
+incorrect_standard_library_use = "allow"
+unknown_required_module = "allow"
+empty_if = "allow"
+unscoped_variables = "allow"
+unused_module_variable = "allow"
