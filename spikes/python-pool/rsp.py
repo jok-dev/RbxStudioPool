@@ -4,7 +4,9 @@
     python rsp.py acquire --worktree DIR [--place-file T.rbxl | --place P --universe U] [--mount NAME=DIR] ...
     python rsp.py sync LEASE DIR                  # (re)sync a worktree into the leased Studio
     python rsp.py luau LEASE [CODE] [--dm Edit|Server|Client] [--file F]
-    python rsp.py play LEASE start|stop|status [--wait REGEX]
+    python rsp.py play LEASE start|stop|status|restart [--wait REGEX]
+    python rsp.py acquire --place-file T.rbxl --clients 2    # multi-client test: server + Player1..2
+    python rsp.py clients LEASE list | add [N] | remove PlayerN [--kick]
     python rsp.py logs LEASE [--dm D] [--level warning] [--grep RE] [--since N]
     python rsp.py wait-log LEASE REGEX [--dm D] [--timeout S] [--new]
     python rsp.py call LEASE TOOL [JSON]          # any Studio MCP tool, studio_id filled in
@@ -71,15 +73,19 @@ DENIED_TOOLS = {
     "subagent": "runs Studio's own assistant",
 }
 READY_TIMEOUT = 300
+SERVER = "server"
+GROUP_PREFIX = "group:"
+GROUP_ATTR = "RspGroup"  # workspace attribute the server sets; replicates to its clients, so they can be told apart
 ROJO_BASE_PORT = 34900
 LEVELS = ["output", "info", "warning", "error"]
 
-# Installs (once per DataModel) a LogService capture behind CoreGui.RspLogs, then queries it. Not capped by the
+# Installs (once per DataModel) a LogService capture as _G.RspLogs, then queries it. Not capped by the
 # 512-entry LogService history, and filtered/grouped in Studio so a flood of one error stays one line.
+# _G (kept per DataModel between execute_luau calls) rather than a BindableFunction in CoreGui: in test-server and
+# test-client windows, an instance parented to CoreGui gets the Network capability, and MCP Luau can't invoke it.
 LOG_CAPTURE = """
-local CoreGui = game:GetService("CoreGui")
 local HttpService = game:GetService("HttpService")
-local fn = CoreGui:FindFirstChild("RspLogs")
+local fn = _G.RspLogs
 if not fn then
 	local LogService = game:GetService("LogService")
 	local LEVEL = {
@@ -103,9 +109,7 @@ if not fn then
 	LogService.MessageOut:Connect(function(message, messageType)
 		add(message, messageType, DateTime.now().UnixTimestampMillis / 1000)
 	end)
-	fn = Instance.new("BindableFunction")
-	fn.Name = "RspLogs"
-	fn.OnInvoke = function(q)
+	fn = function(q)
 		local out, groups = {}, {}
 		for seq = math.max(first, (q.since or 0) + 1), nextSeq - 1 do
 			local e = entries[seq]
@@ -134,9 +138,9 @@ if not fn then
 		end
 		return { id = id, cursor = nextSeq - 1, dropped = first - 1, entries = out }
 	end
-	fn.Parent = CoreGui
+	_G.RspLogs = fn
 end
-return HttpService:JSONEncode(fn:Invoke(HttpService:JSONDecode(%s)))
+return HttpService:JSONEncode(fn(HttpService:JSONDecode(%s)))
 """
 
 log = logging.getLogger("rsp")
@@ -157,6 +161,40 @@ def lua_string(s):
         level += 1
     eq = "=" * level
     return f"[{eq}[{s}]{eq}]"
+
+
+@dataclass
+class Window:
+    """One Studio process of a multi-client group: the test server or one player's client."""
+    target: str  # "server" or the player's name ("Player1", ...)
+    studio_id: str
+    pid: int
+    proc: object = None  # Popen/HiddenProcess when the pool started it (the server, added clients)
+    left: bool = False
+
+    @property
+    def dm(self):
+        return "Server" if self.target == SERVER else "Client"
+
+
+@dataclass
+class Group:
+    """A Clients and Servers test: a test server started from a place file, which starts the first client itself;
+    the pool adds the others by copying that client's command line (server port + the server's transport token)."""
+    template: Path  # the place file each launch copies
+    place_id: str = "0"  # --place/--universe: the server runs as that place (live DataStores)
+    universe_id: str = "0"
+    spec: repo.RepoSpec | None = None  # set when the template was built from a worktree (rebuilt on restart)
+    windows: dict = field(default_factory=dict)  # target -> Window
+    client_cmdline: str | None = None  # holds the transport token: never log or return it
+    next_instance: int = 0
+    tag: str = ""  # this launch's GROUP_ATTR value
+
+    def live(self):
+        return [w for w in self.windows.values() if not w.left]
+
+    def players(self):
+        return [w.target for w in self.live() if w.target != SERVER]
 
 
 @dataclass
@@ -186,6 +224,8 @@ class Slot:
     file_copy: Path | None = None  # local-file slots run on a throwaway copy of the template
     launched_at: float | None = None
     state: str = "launching"  # launching | ready | closing
+    group: Group | None = None  # a multi-client test (server + clients) instead of one edit Studio
+    weight: int = 1  # Studios this slot counts for against the cap (1 + clients for a group)
     idle_since: float = field(default_factory=time.time)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -232,13 +272,18 @@ class Pool:
         with self.cond:
             procs = [(s.proc, "RobloxStudioBeta.exe") for s in self.slots.values()]
             procs += [(s.rojo, "rojo.exe") for s in self.slots.values()]
+            # clients the pool added to a group are not in the test server's process tree
+            procs += [(w.proc, "RobloxStudioBeta.exe") for s in self.slots.values() if s.group
+                      for w in list(s.group.windows.values()) if w.proc and w.target != SERVER]
         live = [{"pid": p.pid, "image": image} for p, image in procs if p and p.poll() is None]
         PIDS.write_text(json.dumps(live))
 
     # --- leasing ---
 
     def acquire(self, place=None, universe=None, place_file=None, team_create=False, fresh=False, client="?",
-                worktree=None, mounts=None, restart_on_code=False, wait=600):
+                worktree=None, mounts=None, restart_on_code=False, wait=600, clients=0):
+        if clients:
+            return self._acquire_group(clients, place_file, worktree, place, universe, client, wait)
         spec = load_spec(worktree) if worktree else None
         built = None
         if spec and not (place_file or place):
@@ -254,34 +299,12 @@ class Pool:
             place, universe = f"{FILE_PREFIX}{template}@{place or 0}", universe or ""
         elif not (place and universe):
             raise PoolError("pass a worktree, place_file, or place + universe")
-        ticket = next(self.tickets)
-        deadline = time.time() + wait
-        evict = None
-        with self.cond:
-            if team_create and any(s.place == place for s in self.slots.values() if s.lease or s.team_create):
-                raise Busy(f"Team Create place {place} is already open in the pool")
-            self.queue.append(ticket)
-            log.info("acquire #%d from %s: place %s (queue %d)", ticket, client, place, len(self.queue))
-            try:
-                while True:
-                    if self.queue[0] == ticket:
-                        slot, evict, reuse = self._pick(place, universe, team_create, fresh)
-                        if slot:
-                            break
-                    left = deadline - time.time()
-                    if left <= 0:
-                        raise Busy(f"no Studio free within {wait}s")
-                    self.cond.wait(min(left, 2))
-            finally:
-                self.queue.remove(ticket)
-                self.cond.notify_all()
-            lease = Lease(secrets.token_hex(4), slot.n, client)
-            slot.lease = lease.id
-            slot.restart_on_code = restart_on_code
-            slot.notices.clear()
-            self.leases[lease.id] = lease
-        if evict:
-            self._close(evict, "evicted for a new launch")
+        if team_create:
+            with self.cond:
+                if any(s.place == place for s in self.slots.values() if s.lease or s.team_create):
+                    raise Busy(f"Team Create place {place} is already open in the pool")
+        slot, lease, reuse = self._take_slot(place, universe, team_create, fresh, client, wait)
+        slot.restart_on_code = restart_on_code
         try:
             if not reuse:
                 self._launch(slot, allow_team_create=team_create)
@@ -311,23 +334,67 @@ class Pool:
         os.replace(tmp, out)
         return out
 
-    def _pick(self, place, universe, team_create, fresh):
-        """Under self.cond. Returns (slot, slot_to_evict, reused)."""
+    def _take_slot(self, place, universe, team_create, fresh, client, wait, weight=1):
+        """Waits its turn in the FIFO queue for a slot (evicting idle Studios to make room), and leases it.
+        Returns (slot, lease, reused)."""
+        if weight > self.cap:
+            raise PoolError(f"needs {weight} Studios but the pool's cap is {self.cap}")
+        ticket = next(self.tickets)
+        deadline = time.time() + wait
+        with self.cond:
+            self.queue.append(ticket)
+            log.info("acquire #%d from %s: place %s, %d Studio(s) (queue %d)", ticket, client, place, weight,
+                     len(self.queue))
+            try:
+                while True:
+                    if self.queue[0] == ticket:
+                        slot, evict, reuse = self._pick(place, universe, team_create, fresh, weight)
+                        if slot:
+                            break
+                    left = deadline - time.time()
+                    if left <= 0:
+                        raise Busy(f"no room for {weight} Studio(s) within {wait}s")
+                    self.cond.wait(min(left, 2))
+            finally:
+                self.queue.remove(ticket)
+                self.cond.notify_all()
+            lease = Lease(secrets.token_hex(4), slot.n, client)
+            slot.lease = lease.id
+            slot.notices.clear()
+            self.leases[lease.id] = lease
+        for e in evict:
+            self._close(e, "evicted for a new launch")
+        return slot, lease, reuse
+
+    def _evict_for(self, weight):
+        """Under self.cond. Takes idle Studios (oldest first) out of the pool until `weight` more fit under the cap.
+        Returns them for the caller to close, or None (nothing taken) if they wouldn't make enough room."""
+        free = self.cap - sum(s.weight for s in self.slots.values())
         idle = sorted((s for s in self.slots.values() if s.lease is None and s.state == "ready"),
                       key=lambda s: s.idle_since)
-        if not fresh:
-            for s in idle:
-                if s.place == place and (team_create or not s.team_create):
-                    return s, None, True
-        evict = None
-        if len(self.slots) >= self.cap:
+        evict = []
+        while free < weight:
             if not idle:
-                return None, None, False
-            evict = idle[0]
-            evict.state = "closing"
-            del self.slots[evict.n]
-        n = next(i for i in itertools.count(1) if i not in self.slots and (evict is None or i != evict.n))
-        slot = Slot(n, place, universe)
+                return None
+            evict.append(idle.pop(0))
+            free += evict[-1].weight
+        for e in evict:
+            e.state = "closing"
+            del self.slots[e.n]
+        return evict
+
+    def _pick(self, place, universe, team_create, fresh, weight=1):
+        """Under self.cond. Returns (slot, slots_to_evict, reused)."""
+        if not fresh:
+            for s in sorted(self.slots.values(), key=lambda s: s.idle_since):
+                if s.lease is None and s.state == "ready" and s.group is None and s.place == place \
+                        and (team_create or not s.team_create):
+                    return s, [], True
+        evict = self._evict_for(weight)
+        if evict is None:
+            return None, [], False
+        n = next(i for i in itertools.count(1) if i not in self.slots and all(i != e.n for e in evict))
+        slot = Slot(n, place, universe, weight=weight)
         self.slots[n] = slot
         return slot, evict, False
 
@@ -370,6 +437,8 @@ class Pool:
 
     def _dirty_reason(self, slot):
         """A Studio is only kept warm if it is a plain edit session; anything else is closed."""
+        if slot.group:
+            return "multi-client test"
         if slot.team_create:
             return "Team Create session"
         try:
@@ -388,9 +457,7 @@ class Pool:
         with self.launch_lock:  # new-Studio detection must not see two launches at once
             before = {s["id"] for s in self.mcp.list_studios()}
             if slot.place.startswith(FILE_PREFIX):
-                slot.file_copy = STATE / "places" / f"slot{slot.n}-{secrets.token_hex(3)}.rbxl"
-                slot.file_copy.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(slot.place[len(FILE_PREFIX):].rsplit("@", 1)[0], slot.file_copy)
+                self._copy_place(slot, slot.place[len(FILE_PREFIX):].rsplit("@", 1)[0])
                 args = [str(slot.file_copy)]
             else:
                 args = ["-task", "EditPlace", "-placeId", slot.place, "-universeId", slot.universe]
@@ -438,6 +505,345 @@ class Pool:
         slot.state = "ready"
         log.info("slot %d: ready in %.0fs%s", slot.n, time.time() - t0, " (TEAM CREATE)" if slot.team_create else "")
 
+    def _copy_place(self, slot, template):
+        slot.file_copy = STATE / "places" / f"slot{slot.n}-{secrets.token_hex(3)}.rbxl"
+        slot.file_copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(template, slot.file_copy)
+
+    def _spawn(self, cmd):
+        return self.desktop.launch(cmd) if self.desktop else subprocess.Popen(cmd)
+
+    # --- multi-client groups (Clients and Servers) ---
+
+    def _acquire_group(self, clients, place_file, worktree, place, universe, client, wait):
+        """A test server plus `clients` players, started from a place file (or a `rojo build` of the worktree)
+        without an edit Studio. --place/--universe are only ever taken from the caller: they make the server run as
+        that place, with that universe's live DataStores."""
+        if clients < 1:
+            raise PoolError("--clients must be at least 1 (the pool learns the server's port from the first client)")
+        if bool(place) != bool(universe):
+            raise PoolError("pass both --place and --universe, or neither")
+        spec = None
+        if place_file:
+            template = Path(place_file).resolve()
+            if not template.is_file():
+                raise PoolError(f"no place file at {template}")
+        elif worktree:
+            spec = load_spec(worktree)
+            if spec.template:
+                template = Path(spec.template).resolve()
+                spec = None  # a saved template, nothing to rebuild
+            else:
+                template = self._build_template(spec)
+        else:
+            raise PoolError("a multi-client test needs --place-file or --worktree")
+        group = Group(template, str(place or 0), str(universe or 0), spec)
+        slot, lease, _ = self._take_slot(f"{GROUP_PREFIX}{template}", "", False, True, client, wait,
+                                         weight=1 + clients)
+        slot.group = group
+        try:
+            t0 = time.time()
+            self._start_group(slot, clients)
+        except Exception:
+            self.release(lease.id, close=True)
+            raise
+        lease.last_seen = time.time()
+        log.info("lease %s -> slot %d: test server + %d clients in %.0fs (%s)", lease.id, slot.n, clients,
+                 time.time() - t0, client)
+        out = {"lease": lease.id, "slot": slot.n, "targets": [SERVER, *group.players()],
+               "place_file": str(template), "took": round(time.time() - t0, 1)}
+        if spec:
+            out["template"] = "built from the worktree with `rojo build` (code only); `play restart` rebuilds it"
+        if group.place_id != "0":
+            out["warning"] = (f"the server runs as place {group.place_id}: DataStores are that universe's live data "
+                              "(players are UserId -1, -2, ...)")
+        return out
+
+    def _start_group(self, slot, clients):
+        """Launches the test server with one client, maps both to their Studio MCP ids, then adds the rest one by
+        one (a launch at a time, so each new MCP id belongs to a known process)."""
+        g = slot.group
+        g.windows.clear()
+        g.client_cmdline = None
+        g.next_instance = 0
+        t0 = time.time()
+        self._copy_place(slot, g.template)
+        cmd = [str(studio_exe()), "-task", "StartServer", "-localProjectFile", slot.file_copy.as_posix(),
+               "-placeId", g.place_id, "-universeId", g.universe_id, "-port", "0", "-creatorId", "0",
+               "-creatorType", "0", "-placeVersion", "0", "-numTestServerPlayersUponStartup", "1"]
+        with self.launch_lock:
+            before = {s["id"] for s in self.mcp.list_studios()}
+            slot.launched_at = time.time()
+            slot.proc = self._spawn(cmd)
+            log.info("slot %d: launched test server pid %d", slot.n, slot.proc.pid)
+            self._save_pids()
+            server_id = client_id = client_pid = None
+            classified = set()
+            while not (server_id and client_id and client_pid):
+                if slot.proc.poll() is not None:
+                    raise PoolError(f"test server exited during launch ({slot.proc.returncode})")
+                if slot.state == "closing":
+                    raise PoolError("closed during launch")
+                if time.time() - t0 > READY_TIMEOUT:
+                    raise PoolError(f"test group not up after {READY_TIMEOUT}s (server in MCP: {bool(server_id)}, "
+                                    f"client in MCP: {bool(client_id)}, client process: {bool(client_pid)})")
+                if not client_pid:
+                    for p in child_processes(slot.proc.pid):
+                        if "-task StartClient" in (p.get("CommandLine") or ""):
+                            client_pid, g.client_cmdline = p["ProcessId"], p["CommandLine"]
+                            self._save_pids()
+                for s in self.mcp.list_studios():
+                    if s["id"] in before or s["id"] in classified:
+                        continue
+                    focus = self._focus(s["id"])  # None until the window answers
+                    if focus == "Server" and not server_id:
+                        server_id = s["id"]
+                    elif focus == "Client" and not client_id:
+                        client_id = s["id"]
+                    elif focus:
+                        raise PoolError(f"unexpected new Studio during the group launch ({focus}): {s}")
+                    if focus:
+                        classified.add(s["id"])
+                time.sleep(1)
+        tag = f"{slot.n}-{secrets.token_hex(3)}"
+        self._luau_retry(server_id, "Server", f'workspace:SetAttribute("{GROUP_ATTR}", "{tag}") '
+                         f'game:GetService("CoreGui"):SetAttribute("{MARKER_ATTR}", {slot.n})', t0)
+        g.windows[SERVER] = Window(SERVER, server_id, slot.proc.pid, slot.proc)
+        self._install_capture(slot, g.windows[SERVER])
+        name = self._client_name(client_id, tag, t0)
+        g.windows[name] = Window(name, client_id, client_pid)
+        self._install_capture(slot, g.windows[name])
+        g.tag = tag
+        log.info("slot %d: test server + %s up in %.0fs", slot.n, name, time.time() - t0)
+        for _ in range(clients - 1):
+            self._add_client(slot)
+        slot.state = "ready"
+
+    def _focus(self, studio_id):
+        """'Server' or 'Client' for a test window (the DataModel its viewport shows), 'Edit' for an edit Studio."""
+        try:
+            _, text = self.mcp.call("get_studio_state", {"studio_id": studio_id}, timeout=15)
+        except Exception:
+            return None
+        m = re.search(r"Focused DataModel in the viewport: (\w+)", text)
+        return m.group(1) if m else None
+
+    def _luau_retry(self, studio_id, dm, code, t0):
+        while True:
+            try:
+                return self.mcp.luau(studio_id, code, datamodel=dm, timeout=15)
+            except Exception as e:
+                if time.time() - t0 > READY_TIMEOUT:
+                    raise PoolError(f"{dm} window never accepted Luau: {e}") from e
+                time.sleep(1)
+
+    def _client_name(self, studio_id, tag, t0):
+        """The client's player name, once it has joined and sees its server's group tag."""
+        code = (f'local p = game:GetService("Players").LocalPlayer '
+                f'return (p and p.Name or "") .. "|" .. tostring(workspace:GetAttribute("{GROUP_ATTR}"))')
+        while True:
+            name, _, seen = self._luau_retry(studio_id, "Client", code, t0).strip().partition("|")
+            if name and seen == tag:
+                return name
+            if name and seen not in ("nil", tag):
+                raise PoolError(f"client {name} belongs to another group ({seen})")
+            if time.time() - t0 > READY_TIMEOUT:
+                raise PoolError(f"client never joined (player {name or '?'}, group {seen})")
+            time.sleep(1)
+
+    def _install_capture(self, slot, w):
+        try:
+            self._query_logs(slot, w.dm, {"since": 1e9, "limit": 0}, retry_for=30, studio_id=w.studio_id)
+        except Exception as e:
+            slot.event("logs", f"could not start log capture in {w.target}: {e}", notice=True)
+
+    def _add_client(self, slot):
+        g = slot.group
+        if not g.client_cmdline:
+            raise PoolError("no client launch line known for this group")
+        t0 = time.time()
+        with self.launch_lock:
+            before = {s["id"] for s in self.mcp.list_studios()}
+            g.next_instance += 1
+            cmd = re.sub(r"-instanceId StudioPlayer_\d+", f"-instanceId StudioPlayer_{g.next_instance}",
+                         g.client_cmdline)
+            proc = self._spawn(cmd)
+            self._save_pids()
+            while True:
+                new = [s["id"] for s in self.mcp.list_studios() if s["id"] not in before]
+                if len(new) == 1:
+                    break
+                if len(new) > 1:
+                    kill_tree(proc)
+                    raise PoolError(f"ambiguous: several new Studios {new}")
+                if proc.poll() is not None or time.time() - t0 > READY_TIMEOUT:
+                    kill_tree(proc)
+                    raise PoolError("added client never appeared in the Studio MCP")
+                time.sleep(1)
+        name = self._client_name(new[0], g.tag, t0)
+        w = g.windows[name] = Window(name, new[0], proc.pid, proc)
+        self._install_capture(slot, w)
+        slot.event("clients", f"{name} joined ({time.time() - t0:.0f}s)")
+        return w
+
+    def clients(self, lease_id, op, target=None, count=1, kick=False):
+        """add [count] | remove TARGET [kick] | list."""
+        _, slot = self.lease(lease_id)
+        g = self._group(slot)
+        if op == "list":
+            return self._group_status(slot)
+        if op == "add":
+            with self.cond:
+                evict = self._evict_for(count)
+                if evict is None:
+                    raise Busy(f"no room under the cap ({self.cap}) for {count} more client(s)")
+                slot.weight += count
+            for e in evict:
+                self._close(e, "evicted for a new client")
+            added = []
+            try:
+                for _ in range(count):
+                    added.append(self._add_client(slot).target)
+            finally:
+                with self.cond:
+                    slot.weight -= count - len(added)
+                    self.cond.notify_all()
+            return {"added": added, **self._group_status(slot)}
+        if op == "remove":
+            w = self._window(slot, target)
+            if w.target == SERVER:
+                raise PoolError("the server can't be removed; release the lease to end the test")
+            t0 = time.time()
+            if kick:  # a clean leave; the kicked window stays on its kick screen, so close it after
+                self.mcp.luau(g.windows[SERVER].studio_id,
+                              f'local p = game:GetService("Players"):FindFirstChild({lua_string(w.target)}) '
+                              'if p then p:Kick("Removed by rbx-studio-pool") end', datamodel="Server")
+                gone = self._wait_player_gone(slot, w.target, 30)
+                self._kill_window(w)
+            else:  # like a player closing Roblox: the server notices the dropped connection
+                self._kill_window(w)
+                gone = self._wait_player_gone(slot, w.target, 90)
+            with self.cond:
+                slot.weight -= 1
+                self.cond.notify_all()
+            slot.event("clients", f"{w.target} removed ({'kick' if kick else 'process killed'})")
+            return {"removed": w.target, "how": "kick" if kick else "process killed",
+                    "server_saw_leave_after": None if gone is None else round(gone - t0, 1),
+                    **self._group_status(slot)}
+        raise PoolError(f"unknown clients op {op}")
+
+    def _wait_player_gone(self, slot, name, timeout):
+        """The time the server stopped listing the player, or None if it still does after timeout."""
+        deadline = time.time() + timeout
+        code = f'return tostring(game:GetService("Players"):FindFirstChild({lua_string(name)}) ~= nil)'
+        while time.time() < deadline:
+            try:
+                if self.mcp.luau(slot.group.windows[SERVER].studio_id, code, datamodel="Server",
+                                 timeout=15).strip() == "false":
+                    return time.time()
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return None
+
+    def _kill_window(self, w):
+        if w.proc:
+            kill_tree(w.proc)
+        else:
+            subprocess.run(["taskkill", "/PID", str(w.pid), "/T", "/F"], capture_output=True)
+        w.left = True
+        deadline = time.time() + 15
+        while time.time() < deadline:  # the Studio MCP keeps listing a killed Studio for a moment
+            try:
+                if all(s["id"] != w.studio_id for s in self.mcp.list_studios()):
+                    return
+            except Exception:
+                return
+            time.sleep(0.5)
+
+    def _stop_group(self, slot):
+        """Kills every window of the group (the server's tree takes its own clients; added clients are separate)."""
+        g = slot.group
+        for w in g.windows.values():
+            if w.target != SERVER and w.proc and not w.left:
+                kill_tree(w.proc)
+        kill_tree(slot.proc)
+        for w in g.windows.values():
+            w.left = True
+        self._save_pids()
+        self._remove_place_copy(slot)
+        ids = {w.studio_id for w in g.windows.values()}
+        deadline = time.time() + 15
+        while ids and time.time() < deadline:
+            try:
+                if not ids & {s["id"] for s in self.mcp.list_studios()}:
+                    break
+            except Exception:
+                break
+            time.sleep(0.5)
+
+    def _restart_group(self, slot):
+        g = slot.group
+        count = max(1, len(g.players()))
+        with slot.play_lock:
+            t0 = time.time()
+            slot.restarting = True
+            try:
+                self._stop_group(slot)
+                with self.cond:
+                    slot.weight = 1 + count
+                if g.spec:
+                    g.template = self._build_template(g.spec)
+                self._start_group(slot, count)
+            finally:
+                slot.restarting = False
+        slot.event("restart", f"test restarted with {count} client(s) in {time.time() - t0:.0f}s")
+        return {"took": round(time.time() - t0, 1), "rebuilt": bool(g.spec), **self._group_status(slot)}
+
+    def _group(self, slot):
+        if not slot.group:
+            raise PoolError("not a multi-client lease (acquire with --clients N)")
+        return slot.group
+
+    def _window(self, slot, target):
+        g = self._group(slot)
+        w = g.windows.get(target or SERVER)
+        if w is None:
+            raise PoolError(f"no target {target!r}; targets: {[SERVER, *g.players()]}")
+        if w.left:
+            raise PoolError(f"{w.target} left the test")
+        if w.proc and w.proc.poll() is not None:
+            w.left = True
+            raise PoolError(f"{w.target}'s Studio exited")
+        return w
+
+    def _target(self, slot, target, dm=None):
+        """(studio_id, datamodel, target name) for a call: the lease's Studio, or a group window."""
+        if slot.group:
+            if dm:
+                raise PoolError("--dm does not apply to a multi-client lease; use --target server|PlayerN")
+            w = self._window(slot, target)
+            return w.studio_id, w.dm, w.target
+        if target:
+            raise PoolError("--target is only for multi-client leases (acquire with --clients N)")
+        return slot.studio_id, dm or self._live_dm(slot), None
+
+    def _group_status(self, slot):
+        g = slot.group
+        return {"targets": [SERVER, *g.players()], "left": [w.target for w in g.windows.values() if w.left],
+                "place_id": g.place_id}
+
+    def _remove_place_copy(self, slot):
+        if not slot.file_copy:
+            return
+        for _ in range(20):  # Studio holds the file briefly after being killed
+            try:
+                slot.file_copy.unlink(missing_ok=True)
+                slot.file_copy.with_name(slot.file_copy.name + ".lock").unlink(missing_ok=True)
+                break
+            except PermissionError:
+                time.sleep(0.5)
+
     def _is_team_create(self, slot):
         try:
             signals = json.loads(self.mcp.luau(slot.studio_id, TEAM_CREATE_PROBE).strip())
@@ -450,17 +856,12 @@ class Pool:
 
     def _close(self, slot, why):
         self._unsync(slot)
+        if slot.group:
+            self._stop_group(slot)
         kill_tree(slot.proc)
         self._save_pids()
         self._remove_autosaves(slot)
-        if slot.file_copy:
-            for _ in range(20):  # Studio holds the file briefly after being killed
-                try:
-                    slot.file_copy.unlink(missing_ok=True)
-                    slot.file_copy.with_name(slot.file_copy.name + ".lock").unlink(missing_ok=True)
-                    break
-                except PermissionError:
-                    time.sleep(0.5)
+        self._remove_place_copy(slot)
         if slot.studio_id:  # the Studio MCP keeps listing a killed Studio for a moment
             deadline = time.time() + 15
             while time.time() < deadline:
@@ -550,6 +951,18 @@ class Pool:
         """start | stop | status | wait. start/stop wait for the mode change; start can also wait for a Server log
         line. wait returns once file changes have been acted on (restart finished, hooks/commands run)."""
         lease, slot = self.lease(lease_id)
+        if slot.group:
+            if op == "status":
+                return {"mode": "multi-client test", "restarting": slot.restarting, **self._group_status(slot),
+                        "new_events": self._new_events(slot)}
+            if op == "restart":
+                out = self._restart_group(slot)
+                if wait:
+                    out["matched"] = self.wait_log(lease_id, wait, timeout=timeout)
+                return out
+            raise PoolError("a multi-client test is always running: use `play LEASE restart`, or release it")
+        if op == "restart":
+            raise PoolError("restart is for multi-client leases; use stop then start")
         if op == "status":
             return self._play_status(slot)
         if op == "wait":
@@ -602,9 +1015,13 @@ class Pool:
             mode = mode.group(1) if mode else text.strip()
         except Exception as e:
             mode = f"unknown ({e})"
+        return {"mode": mode, "playing": slot.playing, "restarting": slot.restarting,
+                "new_events": self._new_events(slot)}
+
+    def _new_events(self, slot):
         new = [e for e in slot.events if e["n"] > slot.events_seen]
         slot.events_seen = slot.event_count
-        return {"mode": mode, "playing": slot.playing, "restarting": slot.restarting, "new_events": new}
+        return new
 
     def _settle(self, slot, timeout=120):
         """Waits until the watcher has acted on recent file changes: an edit is picked up within ~1s, a command it
@@ -649,22 +1066,29 @@ class Pool:
 
     # --- logs ---
 
-    def _query_logs(self, slot, dm, query, retry_for=0):
+    def _query_logs(self, slot, dm, query, retry_for=0, studio_id=None):
         code = LOG_CAPTURE % lua_string(json.dumps(query))
         deadline = time.time() + retry_for
         while True:  # a new Play DataModel may not accept Luau for a moment
             try:
-                return json.loads(self.mcp.luau(slot.studio_id, code, datamodel=dm, timeout=20).strip())
+                return json.loads(self.mcp.luau(studio_id or slot.studio_id, code, datamodel=dm, timeout=20).strip())
             except Exception:
                 if time.time() > deadline:
                     raise
                 time.sleep(0.5)
 
     def logs(self, lease_id, dm=None, level="output", grep=None, since=0, limit=200, group=True, exclude=None,
-             everything=False):
-        """everything: include lines matching log-ignore.txt (noise from installed Studio plugins)."""
+             everything=False, target=None):
+        """everything: include lines matching log-ignore.txt (noise from installed Studio plugins).
+        target: a multi-client lease's window (default server); "all" returns each window's lines."""
         _, slot = self.lease(lease_id)
-        dm = dm or self._live_dm(slot)
+        args = (level, grep, since, limit, group, exclude, everything)
+        if slot.group and target == "all":
+            return {"targets": {t: self._logs(slot, *self._target(slot, t), *args)
+                                for t in [SERVER, *slot.group.players()]}}
+        return self._logs(slot, *self._target(slot, target, dm), *args)
+
+    def _logs(self, slot, studio_id, dm, target, level, grep, since, limit, group, exclude, everything):
         if level not in LEVELS:
             raise PoolError(f"level must be one of {LEVELS}")
         regex = re.compile(grep) if grep else None
@@ -672,44 +1096,56 @@ class Pool:
         if not everything:
             drop += log_ignore()
         out = self._query_logs(slot, dm, {"since": since, "level": LEVELS.index(level), "group": group,
-                                          "limit": 5000 if (regex or drop) else limit})
+                                          "limit": 5000 if (regex or drop) else limit}, studio_id=studio_id)
         entries = [e for e in out["entries"]
                    if (not regex or regex.search(e["msg"])) and not any(d.search(e["msg"]) for d in drop)][-limit:]
         for e in entries:
             e["level"] = LEVELS[e["level"]]
-        return {"dm": dm, "cursor": out["cursor"], "dropped_before": out["dropped"], "entries": entries,
+        return {"dm": dm, **({"target": target} if target else {}), "cursor": out["cursor"],
+                "dropped_before": out["dropped"], "entries": entries,
                 **({"hidden_by_log_ignore": True} if not everything else {})}
 
-    def wait_log(self, lease_id, pattern, dm=None, timeout=60, new=False, fail_on_error=True):
+    def wait_log(self, lease_id, pattern, dm=None, timeout=60, new=False, fail_on_error=True, target=None):
         """Waits for a log line matching pattern in the current playtest, after pending file changes have been acted
         on (so a restart you just caused counts). new: only lines printed from now on. fail_on_error: stop at the
-        game's first error (log-ignore.txt lines excepted) and return it with the lines after it (its stack)."""
+        game's first error (log-ignore.txt lines excepted) and return it with the lines after it (its stack).
+        target: a multi-client lease's window (default server), or "all" for the first match in any window."""
         _, slot = self.lease(lease_id)
         t0 = time.time()
         self._settle(slot, timeout)
-        dm = dm or self._live_dm(slot)
+        if slot.group and target == "all":
+            sources = [self._target(slot, t) for t in [SERVER, *slot.group.players()]]
+        else:
+            sources = [self._target(slot, target, dm)]
         regex, ignore = re.compile(pattern), log_ignore()
-        first = self._query_logs(slot, dm, {"since": 1e9, "limit": 0}, retry_for=30)
-        capture, cursor = first["id"], first["cursor"] if new else 0
+        captures = {}  # studio_id -> [capture id, cursor]
+        for sid, d, _ in sources:
+            first = self._query_logs(slot, d, {"since": 1e9, "limit": 0}, retry_for=30, studio_id=sid)
+            captures[sid] = [first["id"], first["cursor"] if new else 0]
         while True:
-            out = self._query_logs(slot, dm, {"since": cursor, "limit": 5000}, retry_for=30)
-            if out["id"] != capture:  # Play restarted: a new DataModel, read its capture from the start
-                capture, cursor = out["id"], 0
-                continue
-            entries = out["entries"]
-            for i, e in enumerate(entries):
-                if regex.search(e["msg"]):
-                    return {"dm": dm, "seq": e["seq"], "level": LEVELS[e["level"]], "msg": e["msg"],
-                            "waited": round(time.time() - t0, 1)}
-                if fail_on_error and e["level"] == 3 and not any(d.search(e["msg"]) for d in ignore):
-                    stack = [x["msg"][:300] for x in entries[i + 1:i + 8]]
-                    raise PoolError(f"{dm} error before /{pattern}/ matched: {e['msg'][:500]}"
-                                    + (f"; next lines: {json.dumps(stack)}" if stack else "")
-                                    + " (pass --no-fail-on-error to keep waiting)")
-            cursor = out["cursor"]
+            for sid, d, name in sources:
+                where = name or d
+                capture, cursor = captures[sid]
+                out = self._query_logs(slot, d, {"since": cursor, "limit": 5000}, retry_for=30, studio_id=sid)
+                if out["id"] != capture:  # Play restarted: a new DataModel, read its capture from the start
+                    captures[sid] = [out["id"], 0]
+                    out = self._query_logs(slot, d, {"since": 0, "limit": 5000}, retry_for=30, studio_id=sid)
+                entries = out["entries"]
+                for i, e in enumerate(entries):
+                    if regex.search(e["msg"]):
+                        return {"dm": d, **({"target": name} if name else {}), "seq": e["seq"],
+                                "level": LEVELS[e["level"]], "msg": e["msg"], "waited": round(time.time() - t0, 1)}
+                    if fail_on_error and e["level"] == 3 and not any(x.search(e["msg"]) for x in ignore):
+                        stack = [x["msg"][:300] for x in entries[i + 1:i + 8]]
+                        raise PoolError(f"{where} error before /{pattern}/ matched: {e['msg'][:500]}"
+                                        + (f"; next lines: {json.dumps(stack)}" if stack else "")
+                                        + " (pass --no-fail-on-error to keep waiting)")
+                captures[sid][1] = out["cursor"]
             if time.time() - t0 > timeout:
-                tail = self.logs(lease_id, dm, limit=10)["entries"]
-                raise PoolError(f"no {dm} log line matched /{pattern}/ within {timeout}s; last lines: "
+                sid, d, name = sources[0]
+                tail = self._logs(slot, sid, d, name, "output", None, 0, 10, True, None, False)["entries"]
+                raise PoolError(f"no {'log line' if len(sources) > 1 else (name or d) + ' log line'} matched "
+                                f"/{pattern}/ within {timeout}s; last lines{' (' + (name or d) + ')'}: "
                                 + json.dumps([f"[{e['level']}] {e['msg'][:200]}" for e in tail]))
             time.sleep(0.5)
 
@@ -818,7 +1254,7 @@ class Pool:
 
     # --- Studio MCP passthrough ---
 
-    def call(self, lease_id, tool, args):
+    def call(self, lease_id, tool, args, target=None):
         lease, slot = self.lease(lease_id)
         if tool in DENIED_TOOLS:
             raise PoolError(f"{tool} is not available through the pool: {DENIED_TOOLS[tool]}")
@@ -829,9 +1265,10 @@ class Pool:
         if slot.restarting:  # don't talk to a Studio in the middle of stop/start
             with slot.play_lock:
                 pass
-        if tool == "execute_luau" and not args.get("datamodel_type"):
-            args["datamodel_type"] = self._live_dm(slot)
-        args["studio_id"] = slot.studio_id  # always pinned to the lease's Studio
+        studio_id, dm, _ = self._target(slot, target, args.get("datamodel_type") if not slot.group else None)
+        if tool == "execute_luau":
+            args["datamodel_type"] = dm
+        args["studio_id"] = studio_id  # always pinned to the lease's Studio (or the target's window)
         lease.calls += 1
         result, text = self.mcp.call(tool, args, timeout=300)
         images = []
@@ -888,12 +1325,13 @@ class Pool:
             slots = sorted(self.slots.values(), key=lambda s: s.n)
             clients = {l.id: l.client for l in self.leases.values()}
         return [{"label": f"slot {s.n}: {clients.get(s.lease, 'idle')}"
+                          + (f" | test + {len(s.group.players())} clients" if s.group else "")
                           + (f" | {Path(s.worktree).name}" if s.worktree else "")
                           + (" | playing" if s.playing else "") + (f" | {s.state}" if s.state != "ready" else ""),
                  "pid": s.proc.pid if s.proc and s.state == "ready" else None}
                 for s in slots]
 
-    def show(self, hide=False, lease_id=None):
+    def show(self, hide=False, lease_id=None, target=None):
         """Switch the user's screen to the pool desktop (with lease_id: that Studio in front) or back. While the pool
         desktop is showing, the shown lease does not expire: the user is using it, not the agent's commands."""
         if not self.desktop:
@@ -902,9 +1340,15 @@ class Pool:
             self.desktop.hide()
             return {"showing": self.desktop.showing()}
         slot = self.lease(lease_id)[1] if lease_id else None
+        pid = slot.proc.pid if slot else None
+        if slot and slot.group:
+            pid = self._window(slot, target).pid
+        elif target:
+            raise PoolError("--target is only for multi-client leases")
         self.shown_lease = lease_id
-        self.desktop.show(slot.proc.pid if slot else None)
-        return {"showing": self.desktop.showing(), "front": f"slot {slot.n}" if slot else None,
+        self.desktop.show(pid)
+        return {"showing": self.desktop.showing(),
+                "front": f"slot {slot.n}" + (f" {target or SERVER}" if slot.group else "") if slot else None,
                 "note": "the user is now looking at the pool desktop; this lease won't expire while it shows"}
 
     def status(self):
@@ -923,7 +1367,9 @@ class Pool:
                     "client": self.leases[s.lease].client if s.lease in self.leases else None,
                     "idle_for": None if s.lease else round(now - s.idle_since),
                     "last_event": s.events[-1] if s.events else None,
+                    **({"studios": s.weight, "targets": [SERVER, *s.group.players()]} if s.group else {}),
                 } for s in sorted(self.slots.values(), key=lambda s: s.n)],
+                "studios_used": sum(s.weight for s in self.slots.values()),
             }
 
     def shutdown(self):
@@ -958,6 +1404,18 @@ def load_spec(worktree):
 
 def describe_watch(watch):
     return {"paths": watch.paths, "action": watch.action, **({"run": watch.run.name} if watch.run else {})}
+
+
+def child_processes(parent_pid):
+    """[{ProcessId, CommandLine}] of a process's children (command lines can hold secrets: don't log them)."""
+    ps = (f'Get-CimInstance Win32_Process -Filter "ParentProcessId={int(parent_pid)}" '
+          "| Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=30).stdout.strip()
+    if not out:
+        return []
+    data = json.loads(out)
+    return [data] if isinstance(data, dict) else data
 
 
 def kill_leftovers():
@@ -1001,18 +1459,21 @@ def make_handler(p: Pool):
             routes = {
                 "/acquire": lambda: p.acquire(**body),
                 "/sync": lambda: p.sync(body["lease"], body["worktree"], body.get("mounts")),
-                "/call": lambda: p.call(body["lease"], body["tool"], body.get("args")),
+                "/call": lambda: p.call(body["lease"], body["tool"], body.get("args"), body.get("target")),
                 "/play": lambda: p.play(body["lease"], body["op"], body.get("wait"), body.get("timeout", 120)),
                 "/logs": lambda: p.logs(body["lease"], body.get("dm"), body.get("level", "output"), body.get("grep"),
                                         body.get("since", 0), body.get("limit", 200), body.get("group", True),
-                                        body.get("exclude"), body.get("all", False)),
+                                        body.get("exclude"), body.get("all", False), body.get("target")),
                 "/wait_log": lambda: p.wait_log(body["lease"], body["pattern"], body.get("dm"),
                                                 body.get("timeout", 60), body.get("new", False),
-                                                body.get("fail_on_error", True)),
+                                                body.get("fail_on_error", True), body.get("target")),
+                "/clients": lambda: p.clients(body["lease"], body["op"], body.get("target"), body.get("count", 1),
+                                              body.get("kick", False)),
                 "/release": lambda: p.release(body["lease"], close=body.get("close", False)),
                 "/heartbeat": lambda: {"ok": bool(p.lease(body["lease"]))},
                 "/rojo": lambda: p.rojo(body["lease"], body["op"], body.get("on")),
-                "/show": lambda: p.show(hide=body.get("hide", False), lease_id=body.get("lease")),
+                "/show": lambda: p.show(hide=body.get("hide", False), lease_id=body.get("lease"),
+                                        target=body.get("target")),
                 "/shutdown": lambda: threading.Thread(target=self.server.shutdown).start() or {"ok": True},
             }
             route = routes.get(self.path)
@@ -1087,7 +1548,7 @@ def print_notices(out):
 
 
 def print_logs(out):
-    print(f"# {out['dm']} log of the current playtest, cursor {out['cursor']} (--since {out['cursor']} for newer lines)"
+    print(f"# {out.get('target') or out['dm']} log of the current playtest, cursor {out['cursor']} (--since {out['cursor']} for newer lines)"
           + (f", {out['dropped_before']} oldest lines dropped" if out["dropped_before"] else "")
           + (", plugin noise hidden (--all shows it)" if out.get("hidden_by_log_ignore") else ""))
     for e in out["entries"]:
@@ -1129,6 +1590,9 @@ def main():
     a.add_argument("--fresh", action="store_true", help="never reuse a warm Studio")
     a.add_argument("--client", default="cli")
     a.add_argument("--wait", type=int, default=600)
+    a.add_argument("--clients", type=int, default=0, metavar="N",
+                   help="multi-client test: a test server + N players (Clients and Servers), from --place-file or "
+                        "a `rojo build` of --worktree; targets are server, Player1..PlayerN")
     y = sub.add_parser("sync")
     y.add_argument("lease")
     y.add_argument("worktree")
@@ -1138,10 +1602,12 @@ def main():
     lu.add_argument("code", nargs="?", help="Luau source, or - for stdin")
     lu.add_argument("--file", help="read the Luau from this file")
     lu.add_argument("--dm", choices=["Edit", "Server", "Client"], help="default: Edit, or Server while playing")
+    lu.add_argument("--target", help="multi-client lease: server (default), PlayerN")
     pl = sub.add_parser("play", help="start | stop | status")
     pl.add_argument("lease")
-    pl.add_argument("op", choices=["start", "stop", "status", "wait"],
-                    help="wait: until file changes have been acted on (e.g. a restart-on-code restart finished)")
+    pl.add_argument("op", choices=["start", "stop", "status", "wait", "restart"],
+                    help="wait: until file changes have been acted on (e.g. a restart-on-code restart finished); "
+                         "restart: relaunch a multi-client test (rebuilt from the worktree if it was built)")
     pl.add_argument("--wait", metavar="REGEX", help="after start, wait for a Server log line matching this")
     pl.add_argument("--timeout", type=int, default=120)
     lg = sub.add_parser("logs", help="captured log lines, repeats grouped")
@@ -1155,6 +1621,7 @@ def main():
     lg.add_argument("--exclude", metavar="REGEX", help="hide lines matching this")
     lg.add_argument("--all", action="store_true", help="also show lines matching log-ignore.txt (plugin noise)")
     lg.add_argument("--json", action="store_true")
+    lg.add_argument("--target", help="multi-client lease: server (default), PlayerN, or all")
     wl = sub.add_parser("wait-log", help="wait for a log line matching REGEX")
     wl.add_argument("lease")
     wl.add_argument("pattern", metavar="REGEX")
@@ -1162,10 +1629,18 @@ def main():
     wl.add_argument("--timeout", type=int, default=60)
     wl.add_argument("--new", action="store_true", help="only lines printed after this command starts")
     wl.add_argument("--no-fail-on-error", action="store_true", help="keep waiting past game errors")
+    wl.add_argument("--target", help="multi-client lease: server (default), PlayerN, or all (first match in any window)")
     c = sub.add_parser("call")
     c.add_argument("lease")
     c.add_argument("tool")
     c.add_argument("args", nargs="?", default="{}")
+    c.add_argument("--target", help="multi-client lease: server (default), PlayerN")
+    cl = sub.add_parser("clients", help="multi-client lease: list | add [N] | remove PlayerN [--kick]")
+    cl.add_argument("lease")
+    cl.add_argument("op", choices=["list", "add", "remove"])
+    cl.add_argument("arg", nargs="?", help="add: how many (default 1); remove: the player, e.g. Player2")
+    cl.add_argument("--kick", action="store_true",
+                    help="remove with Player:Kick() (a clean leave) instead of killing the client's process")
     r = sub.add_parser("release")
     r.add_argument("lease")
     r.add_argument("--close", action="store_true")
@@ -1178,6 +1653,7 @@ def main():
     t.add_argument("name", nargs="?", help="show this tool's full schema")
     sh = sub.add_parser("show", help="switch the screen to the pool desktop (Ctrl+Alt+F12), LEASE's Studio in front")
     sh.add_argument("lease", nargs="?")
+    sh.add_argument("--target", help="multi-client lease: server (default), PlayerN")
     sub.add_parser("hide", help="switch back to your desktop")
     sub.add_parser("shutdown", help="close every pool Studio and stop the daemon")
     args = ap.parse_args()
@@ -1189,7 +1665,7 @@ def main():
             "place": args.place, "universe": args.universe, "place_file": args.place_file,
             "worktree": args.worktree, "mounts": parse_pairs(args.mount),
             "team_create": args.team_create, "restart_on_code": args.restart_on_code, "fresh": args.fresh,
-            "client": args.client, "wait": args.wait})
+            "client": args.client, "wait": args.wait, "clients": args.clients})
     elif args.cmd == "sync":
         out = request("POST", "/sync", {"lease": args.lease, "worktree": args.worktree,
                                         "mounts": parse_pairs(args.mount)})
@@ -1203,7 +1679,8 @@ def main():
         else:
             fail("pass CODE, - (stdin) or --file")
         tool_args = {"code": code, **({"datamodel_type": args.dm} if args.dm else {})}
-        out = request("POST", "/call", {"lease": args.lease, "tool": "execute_luau", "args": tool_args})
+        out = request("POST", "/call", {"lease": args.lease, "tool": "execute_luau", "args": tool_args,
+                                        "target": args.target})
         print_notices(out)
         print(out["text"])
         return
@@ -1213,25 +1690,40 @@ def main():
     elif args.cmd == "logs":
         out = request("POST", "/logs", {"lease": args.lease, "dm": args.dm, "level": args.level, "grep": args.grep,
                                         "since": args.since, "limit": args.limit, "group": not args.no_group,
-                                        "exclude": args.exclude, "all": args.all})
+                                        "exclude": args.exclude, "all": args.all, "target": args.target})
         print_notices(out)
-        return print(json.dumps(out, indent=2)) if args.json else print_logs(out)
+        if args.json:
+            return print(json.dumps(out, indent=2))
+        for logs in (out["targets"].values() if "targets" in out else [out]):
+            print_logs(logs)
+        return
     elif args.cmd == "wait-log":
         out = request("POST", "/wait_log", {"lease": args.lease, "pattern": args.pattern, "dm": args.dm,
                                             "timeout": args.timeout, "new": args.new,
-                                            "fail_on_error": not args.no_fail_on_error})
+                                            "fail_on_error": not args.no_fail_on_error, "target": args.target})
     elif args.cmd == "call":
         try:
             tool_args = json.loads(args.args)
         except json.JSONDecodeError as e:
             fail(f"ARGS is not JSON: {e}")
-        out = request("POST", "/call", {"lease": args.lease, "tool": args.tool, "args": tool_args})
+        out = request("POST", "/call", {"lease": args.lease, "tool": args.tool, "args": tool_args,
+                                        "target": args.target})
+    elif args.cmd == "clients":
+        body = {"lease": args.lease, "op": args.op, "kick": args.kick}
+        if args.op == "add":
+            body["count"] = int(args.arg or 1)
+        elif args.op == "remove":
+            if not args.arg:
+                fail("remove needs the player, e.g. `clients LEASE remove Player2`")
+            body["target"] = args.arg
+        out = request("POST", "/clients", body)
     elif args.cmd == "release":
         out = request("POST", "/release", {"lease": args.lease, "close": args.close})
     elif args.cmd == "rojo":
         out = request("POST", "/rojo", {"lease": args.lease, "op": args.op.replace("-", "_"), "on": args.on == "on"})
     elif args.cmd in ("show", "hide"):
-        out = request("POST", "/show", {"hide": args.cmd == "hide", "lease": getattr(args, "lease", None)})
+        out = request("POST", "/show", {"hide": args.cmd == "hide", "lease": getattr(args, "lease", None),
+                                        "target": getattr(args, "target", None)})
     elif args.cmd == "shutdown":
         out = request("POST", "/shutdown", {})
     elif args.cmd == "status":

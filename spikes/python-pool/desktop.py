@@ -12,6 +12,7 @@ import logging
 import queue
 import subprocess
 import threading
+from pathlib import Path
 
 log = logging.getLogger("rsp")
 user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
@@ -19,6 +20,10 @@ user32.CreateDesktopW.restype = wt.HANDLE
 user32.OpenDesktopW.restype = wt.HANDLE
 user32.OpenInputDesktop.restype = wt.HANDLE
 kernel32.OpenProcess.restype = wt.HANDLE
+user32.LoadImageW.restype = wt.HANDLE
+user32.SendMessageW.restype = ctypes.c_void_p
+user32.SendMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+_icons = set()  # icon handles set_window_icon loaded
 
 DESKTOP_NAME = "rbx-studio-pool"
 GENERIC_ALL = 0x10000000
@@ -27,6 +32,7 @@ VK_F12 = 0x7B
 WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
 HOTKEY = (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F12)
 HOTKEY_TEXT = "Ctrl+Alt+F12"
+ICON = Path(__file__).resolve().parents[2] / "assets" / "icon.ico"  # made from assets/icon.svg
 STILL_ACTIVE = 259
 
 
@@ -77,20 +83,25 @@ class PoolDesktop:
         if not self.handle:
             raise OSError(f"CreateDesktop failed ({ctypes.GetLastError()})")
         self._threads = []
+        # its own taskbar identity, so the taskbar button shows the pool's icon instead of grouping under python.exe
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("rbx-studio-pool")
         self._front = queue.Queue()  # pids for the bar thread (on the pool desktop) to bring to the front
         self.hotkey_registered = None
         self._start(self._hotkey_loop, self.user)
         self._start(self._bar, self.handle)
+        self._start(self._taskbar_button, self.user)
         log.info("pool desktop %r ready; %s switches between it and %r", DESKTOP_NAME, HOTKEY_TEXT, self.user_name)
 
     # --- launching ---
 
     def launch(self, args, cwd=None):
+        """args: a list, or an already quoted command line (e.g. one copied from another process)."""
         si = STARTUPINFOW()
         si.cb = ctypes.sizeof(si)
         si.lpDesktop = f"WinSta0\\{DESKTOP_NAME}"
         pi = PROCESS_INFORMATION()
-        if not kernel32.CreateProcessW(None, ctypes.create_unicode_buffer(subprocess.list2cmdline(args)), None, None,
+        cmdline = args if isinstance(args, str) else subprocess.list2cmdline(args)
+        if not kernel32.CreateProcessW(None, ctypes.create_unicode_buffer(cmdline), None, None,
                                        False, 0, None, cwd, ctypes.byref(si), ctypes.byref(pi)):
             raise OSError(f"CreateProcess failed ({ctypes.GetLastError()})")
         return HiddenProcess(pi)
@@ -196,6 +207,65 @@ class PoolDesktop:
         refresh()
         take_requests()
         root.mainloop()
+
+    def _taskbar_button(self):
+        """A window on the user's desktop that only ever sits minimized, so the pool shows in the taskbar like an
+        app. Clicking it restores the window; that switches to the pool desktop and minimizes it again. It must stay
+        minimized: on the way back Windows re-activates the desktop's last active window, and an open one would
+        switch straight back to the pool."""
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.geometry("1x1+0+0")
+        root.protocol("WM_DELETE_WINDOW", root.iconify)  # closing it from the taskbar just minimizes it
+        armed = False  # the first <Map> is the window being created, not a click
+
+        def clicked(event):
+            if event.widget is not root or not armed:
+                return
+            root.iconify()
+            try:
+                self.show()
+            except OSError as e:
+                log.warning("taskbar switch failed: %s", e)
+
+        def arm():
+            nonlocal armed
+            armed = True
+
+        def refresh():
+            try:
+                n = len(self.status())
+            except Exception:
+                n = "?"
+            title = f"rbx-studio-pool ({n} running, {HOTKEY_TEXT})"
+            if root.title() != title:
+                root.title(title)
+            set_window_icon(int(root.wm_frame(), 16))  # only acts while the window has no icon of ours
+            root.after(2000, refresh)
+
+        root.bind("<Map>", clicked)
+        root.iconify()
+        root.after(1000, arm)
+        refresh()
+        root.mainloop()
+
+
+def set_window_icon(hwnd):
+    """Gives a window the pool's icon, big (taskbar) and small (title bar), straight from the .ico: tk's own icon
+    calls left the taskbar button on tk's feather."""
+    LR_LOADFROMFILE, IMAGE_ICON, WM_SETICON, WM_GETICON = 0x10, 1, 0x0080, 0x007F
+    if not ICON.is_file() or user32.SendMessageW(hwnd, WM_GETICON, 1, 0) in _icons:
+        return
+    # ICON_BIG at SM_CXICON, ICON_SMALL at SM_CXSMICON: the .ico's frame of that size (they follow display scaling)
+    for which, metric in ((1, 11), (0, 49)):
+        size = user32.GetSystemMetrics(metric)
+        icon = user32.LoadImageW(None, str(ICON), IMAGE_ICON, size, size, LR_LOADFROMFILE)
+        if icon:
+            _icons.add(icon)
+            user32.SendMessageW(hwnd, WM_SETICON, which, icon)
+        else:
+            log.warning("could not load %s (%d)", ICON, ctypes.GetLastError())
 
 
 def studio_window(pid):

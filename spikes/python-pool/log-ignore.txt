@@ -2,3 +2,5 @@
 # `rsp logs` hides these unless --all; `wait-log` does not stop on errors matching them.
 ^RoMixamo
 rbxassetid://203785492
+# the pool's own RojoControl fork, in test-server windows (CoreGui attributes there are capped at 50 characters)
+Attribute string value exceeds 50 character limit \("RojoControlState"\)

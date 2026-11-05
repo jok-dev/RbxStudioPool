@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>rbx-studio-pool</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2738"/>
+      <stop offset="1" stop-color="#0e131c"/>
+    </linearGradient>
+    <linearGradient id="front" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5fd0ff"/>
+      <stop offset="1" stop-color="#2f7fe8"/>
+    </linearGradient>
+  </defs>
+  <!-- background -->
+  <rect x="0" y="0" width="256" height="256" rx="56" fill="url(#bg)"/>
+  <!-- the pool: three Studio windows, stacked; each has a background-colored outline to separate it -->
+  <rect x="47" y="45" width="120" height="120" rx="24" fill="#24497a" stroke="#141b27" stroke-width="8"/>
+  <rect x="69" y="67" width="120" height="120" rx="24" fill="#2f68b0" stroke="#141b27" stroke-width="8"/>
+  <rect x="91" y="89" width="120" height="120" rx="24" fill="url(#front)" stroke="#121821" stroke-width="8"/>
+  <!-- play: the front Studio is running -->
+  <path d="M137 126 L137 172 L177 149 Z" fill="#ffffff" stroke="#ffffff" stroke-width="8" stroke-linejoin="round"/>
+</svg>

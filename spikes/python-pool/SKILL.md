@@ -31,6 +31,24 @@ All commands: `python <RSP_HOME>/spikes/python-pool/rsp.py <command>` (the repo'
 5. **Code changes:** edit files in the worktree. Rojo syncs them to Studio in ~2s. A running playtest does **not** rerun changed scripts: `play stop` then `play start`, or acquire with `--restart-on-code`.
 6. **Release** when done, also after failures: `rsp release LEASE --close`.
 
+## Multi-client tests (Clients and Servers)
+
+For anything that needs several players at once (collisions between players, joining and leaving, replication):
+```
+rsp acquire --place-file T.rbxl --clients 2 --client <your-name>     # or --worktree DIR (a `rojo build` of it)
+```
+- You get a test server plus `Player1`…`PlayerN`, each its own Studio window (~2 GB each; together they count 1+N against the pool's cap). No edit Studio, no live Rojo: the test runs on a copy of the place file. After changing code, `rsp play LEASE restart` relaunches the test (rebuilt from the worktree when it came from one; ~15s) with the players currently in it.
+- Point commands at a window with `--target server|Player1|…` (default `server`): `luau`, `logs`, `wait-log`, `call`, `show`. `logs` and `wait-log` also take `--target all`. `--dm` doesn't apply.
+- Players come and go mid-test: `rsp clients LEASE add [N]` (joins in ~10s), `rsp clients LEASE remove Player2 --kick` (a clean leave; `PlayerRemoving` within ~1s), or without `--kick` (kills the client like a crash; the server notices only after its ~60s timeout). Player names are never reused: after Player2 leaves, the next joiner is Player3 or later. `rsp clients LEASE list` shows who's in.
+- Players are test accounts with UserId -1, -2, … in join order, and each joiner gets a new one. To test "save, leave, rejoin, load": save as Player1, then `play restart` or acquire a new test: Player1 is -1 again.
+- `game.PlaceId` is 0 and DataStores are off, unless you pass `--place P --universe U`: the server then runs as that place against **that universe's live DataStores**. Only do that when asked.
+- Killing the server skips `game:BindToClose` (and `game:Shutdown()` does nothing in a test server), so code that saves on shutdown doesn't run on release.
+
+Things that work differently in a multi-client test:
+- Luau from `luau` runs sandboxed: it can't `require` game modules or parent anything containing scripts into the game ("lacking capability Network"). Drive the game the way a player would: from a client, fire prompts (`ProximityPrompt:InputHoldBegin()`/`InputHoldEnd()` within `MaxActivationDistance`) and input actions (`InputAction:Fire(1)`); from the server, move characters (`Character:PivotTo`) and seat players (`Seat:Sit(humanoid)`).
+- With `Workspace.AuthorityMode = Server` the server owns characters: moving one from its client snaps back. Move characters from the server.
+- `GetChildren()` order differs between the server and clients. Don't match instances across windows by index; use names, attributes or position.
+
 ## Repo settings (`.rbx-studio-pool/pool.toml`)
 
 A repo can declare, in its root:
