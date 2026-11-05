@@ -54,6 +54,10 @@ IDLE_TTL = int(os.environ.get("RSP_IDLE_TTL", 900))
 VISIBLE = os.environ.get("RSP_VISIBLE") == "1"  # launch Studios on the user's desktop (they will take focus)
 PIDS = STATE / "pids.json"
 AUTOSAVES = Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "RobloxStudio" / "AutoSaves"
+# A test server (-task StartServer) always opens this file; -localProjectFile/-localPlaceFile don't change that.
+# Studio's own Play (Clients and Servers) writes it just before launching its server, so it is scratch, shared by
+# every Studio on the machine.
+TEST_SERVER_PLACE = Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "server.rbxl"
 FILE_PREFIX = "file:"
 # The RojoControl plugin fork (rojo-plugin/RojoControl.lua): JSON command in, JSON state out, on CoreGui.
 ROJO_COMMAND_ATTR = "RojoControlCommand"
@@ -573,6 +577,9 @@ class Pool:
                "-creatorType", "0", "-placeVersion", "0", "-numTestServerPlayersUponStartup", "1"]
         with self.launch_lock:
             before = {s["id"] for s in self.mcp.list_studios()}
+            # the server loads TEST_SERVER_PLACE, not -localProjectFile (kept: it names the place in the window)
+            shutil.copyfile(slot.file_copy, TEST_SERVER_PLACE)
+            placed = TEST_SERVER_PLACE.stat()
             slot.launched_at = time.time()
             slot.proc = self._spawn(cmd)
             log.info("slot %d: launched test server pid %d", slot.n, slot.proc.pid)
@@ -605,6 +612,10 @@ class Pool:
                     if focus:
                         classified.add(s["id"])
                 time.sleep(1)
+            now = TEST_SERVER_PLACE.stat()
+            if (now.st_size, now.st_mtime_ns) != (placed.st_size, placed.st_mtime_ns):
+                # another Studio started a Clients and Servers test while ours was loading
+                raise PoolError(f"{TEST_SERVER_PLACE} was replaced while the test server loaded it; try again")
         tag = f"{slot.n}-{secrets.token_hex(3)}"
         self._luau_retry(server_id, "Server", f'workspace:SetAttribute("{GROUP_ATTR}", "{tag}") '
                          f'game:GetService("CoreGui"):SetAttribute("{MARKER_ATTR}", {slot.n})', t0)
