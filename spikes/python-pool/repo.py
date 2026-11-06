@@ -4,6 +4,7 @@
     place = 123456789                     # optional: what local copies pretend to be (SetPlaceId/SetUniverseId)
     universe = 987654321
     template = "C:/path/to/map.rbxl"      # optional: local template; default is `rojo build` of the project
+    # or: template = "cloud"              # download `place` from Roblox (cached by version); "cloud:<id>" for another
     rojo = "C:/path/to/rojo.exe"          # optional: default is the repo's toolchain (rokit.toml / aftman.toml)
 
     [[prepare]]                           # run in the worktree before Rojo when `creates` is missing
@@ -51,6 +52,9 @@ class Mount:
     default: Path | None
 
     def included(self, rel_parts):
+        # Rojo reserves "$" keys in a project tree, so an entry named like "$env" would make `rojo serve` exit
+        if rel_parts[0].startswith("$"):
+            return False
         return not any(fnmatch.fnmatch(rel_parts[0], pattern) for pattern in self.ignore)
 
 
@@ -69,12 +73,25 @@ class RepoSpec:
     project: Path
     place: str | None = None
     universe: str | None = None
-    template: Path | None = None
+    template: Path | str | None = None  # a path, or "cloud:<placeId>"
     prepare: list[dict] = field(default_factory=list)
     mounts: dict[str, Mount] = field(default_factory=dict)
     watches: list[Watch] = field(default_factory=list)
     from_file: bool = False
     rojo: str = "rojo"
+
+
+def _template(raw, root, spec_path):
+    t = raw.get("template")
+    if t is None:
+        return None
+    if t == "cloud":
+        if "place" not in raw:
+            raise RepoError(f'{spec_path}: template = "cloud" needs `place`')
+        return f"cloud:{raw['place']}"
+    if str(t).startswith("cloud:"):
+        return str(t)
+    return root / t
 
 
 def load(worktree) -> RepoSpec:
@@ -92,7 +109,7 @@ def load(worktree) -> RepoSpec:
             root / raw.get("project", DEFAULT_PROJECT),
             place=str(raw["place"]) if "place" in raw else None,
             universe=str(raw["universe"]) if "universe" in raw else None,
-            template=root / raw["template"] if "template" in raw else None,
+            template=_template(raw, root, spec_path),
             prepare=list(raw.get("prepare", [])),
             from_file=True,
         )

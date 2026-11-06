@@ -17,6 +17,7 @@ All commands: `python <RSP_HOME>/spikes/python-pool/rsp.py <command>` (the repo'
    ```
    - With only `--worktree`, the Studio opens a throwaway local copy of `rojo build` of the project (code only; nothing can be saved to Roblox). Fine for games whose world is in the repo.
    - `--place-file T.rbxl`: a local copy of that template instead (e.g. a place saved with its map).
+   - `--place-file cloud:PLACE_ID`: a local copy of the cloud place's current version, downloaded by the pool (cached; a re-download only when the place changed, so the first acquire of a big place takes longer). Same throwaway copy as a file, so it works with `--clients N`. The result's `cloud_place` says `hit` or `downloaded`. If it fails with "no Roblox API key" or HTTP 401/403, tell the user; they set the key with `rsp cloud-key set`. Never ask for, print or pass the key yourself.
    - `--place P --universe U`: the real cloud place. Needed when the game depends on instances only the place has. Never publish or save it.
    - `--restart-on-code`: editing code during a playtest you started restarts it (~6s small game, ~30s big).
    - The result lists `mounts`, `watches` and `rojo` (`state` should be `live`; on `error`, read `rojo.error`).
@@ -36,6 +37,7 @@ All commands: `python <RSP_HOME>/spikes/python-pool/rsp.py <command>` (the repo'
 For anything that needs several players at once (collisions between players, joining and leaving, replication):
 ```
 rsp acquire --place-file T.rbxl --clients 2 --client <your-name>     # or --worktree DIR (a `rojo build` of it)
+rsp acquire --place-file cloud:PLACE_ID --clients 2 --client <your-name>   # the real map, downloaded by the pool
 ```
 - You get a test server plus `Player1`…`PlayerN`, each its own Studio window (~2 GB each; together they count 1+N against the pool's cap). No edit Studio, no live Rojo: the test runs on a copy of the place file. After changing code, `rsp play LEASE restart` relaunches the test (rebuilt from the worktree when it came from one; ~15s) with the players currently in it.
 - Point commands at a window with `--target server|Player1|…` (default `server`): `luau`, `logs`, `wait-log`, `call`, `show`. `logs` and `wait-log` also take `--target all`. `--dm` doesn't apply.

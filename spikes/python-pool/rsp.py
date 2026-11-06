@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import cloudplace
 import desktop
 import pool
 import repo
@@ -49,6 +50,7 @@ from pool import MARKER_ATTR, TEAM_CREATE_PROBE, StudioMcp, kill_tree, port_open
 
 HOST, PORT = "127.0.0.1", 7811
 STATE = Path(__file__).parent / "state"
+CLOUD_PLACES = STATE / "cloud-places"  # cloudplace.fetch cache: <placeId>/<version>.rbxl
 LEASE_TTL = int(os.environ.get("RSP_LEASE_TTL", 600))
 IDLE_TTL = int(os.environ.get("RSP_IDLE_TTL", 900))
 VISIBLE = os.environ.get("RSP_VISIBLE") == "1"  # launch Studios on the user's desktop (they will take focus)
@@ -58,6 +60,12 @@ AUTOSAVES = Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "RobloxStudio"
 # Studio's own Play (Clients and Servers) writes it just before launching its server, so it is scratch, shared by
 # every Studio on the machine.
 TEST_SERVER_PLACE = Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "server.rbxl"
+STUDIO_LOGS = Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "logs"
+# A person's Play writes TEST_SERVER_PLACE and their server opens it ~3s later; once the file has been untouched this
+# long, nobody is about to read it.
+PLACE_QUIET_SECS = 15
+PLACE_QUIET_WAIT = 180
+GROUP_LAUNCH_TRIES = 3
 FILE_PREFIX = "file:"
 # The RojoControl plugin fork (rojo-plugin/RojoControl.lua): JSON command in, JSON state out, on CoreGui.
 ROJO_COMMAND_ATTR = "RojoControlCommand"
@@ -152,6 +160,10 @@ log = logging.getLogger("rsp")
 
 class PoolError(Exception):
     status = 400
+
+
+class PlaceCollision(PoolError):
+    """Another Studio wrote TEST_SERVER_PLACE between our write and our test server reading it."""
 
 
 class Busy(PoolError):
@@ -289,15 +301,13 @@ class Pool:
         if clients:
             return self._acquire_group(clients, place_file, worktree, place, universe, client, wait)
         spec = load_spec(worktree) if worktree else None
-        built = None
+        built = cloud = None
         if spec and not (place_file or place):
             # no place given: a local copy of the repo's template, or of a `rojo build` of its project
             place_file = spec.template or self._build_template(spec)
             built = not spec.template
         if place_file:
-            template = Path(place_file).resolve()
-            if not template.is_file():
-                raise PoolError(f"no place file at {template}")
+            template, cloud = self._place_file(place_file)
             place, universe = place or (spec and spec.place), universe or (spec and spec.universe)
             # optional place/universe: the copy is told it is that place (SetPlaceId/SetUniverseId), which carries into Play
             place, universe = f"{FILE_PREFIX}{template}@{place or 0}", universe or ""
@@ -322,9 +332,31 @@ class Pool:
                "team_create": slot.team_create, "place": slot.place}
         if built:
             out["template"] = "built from the project with `rojo build` (code only)"
+        if cloud:
+            out["cloud_place"] = cloud
         if synced:
             out.update({k: synced[k] for k in ("worktree", "mounts", "skipped_mounts", "prepared", "watches", "rojo")})
         return out
+
+    def _place_file(self, place_file):
+        """A template path from --place-file / pool.toml: a local .rbxl, or "cloud:<placeId>", downloaded (or taken
+        from the cache when the place has not changed). Returns (path, cloud info or None)."""
+        try:
+            cloud_id = cloudplace.parse(str(place_file))
+            if cloud_id:
+                with self.cond:
+                    in_use = {s.place[len(FILE_PREFIX):].rsplit("@", 1)[0] for s in self.slots.values()
+                              if s.place.startswith(FILE_PREFIX)}
+                    in_use |= {str(s.group.template) for s in self.slots.values() if s.group}
+                path, info = cloudplace.fetch(cloud_id, CLOUD_PLACES, in_use)
+                log.info("cloud place %s: %s (%s MB, %ss)", cloud_id, info["cache"], info["mb"], info["took"])
+                return path.resolve(), info
+        except cloudplace.CloudPlaceError as e:
+            raise PoolError(f"cloud place: {e}") from None
+        template = Path(place_file).resolve()
+        if not template.is_file():
+            raise PoolError(f"no place file at {template}")
+        return template, None
 
     def _build_template(self, spec):
         repo.prepare(spec)
@@ -527,15 +559,13 @@ class Pool:
             raise PoolError("--clients must be at least 1 (the pool learns the server's port from the first client)")
         if bool(place) != bool(universe):
             raise PoolError("pass both --place and --universe, or neither")
-        spec = None
+        spec = cloud = None
         if place_file:
-            template = Path(place_file).resolve()
-            if not template.is_file():
-                raise PoolError(f"no place file at {template}")
+            template, cloud = self._place_file(place_file)
         elif worktree:
             spec = load_spec(worktree)
             if spec.template:
-                template = Path(spec.template).resolve()
+                template, cloud = self._place_file(spec.template)
                 spec = None  # a saved template, nothing to rebuild
             else:
                 template = self._build_template(spec)
@@ -558,6 +588,8 @@ class Pool:
                "place_file": str(template), "took": round(time.time() - t0, 1)}
         if spec:
             out["template"] = "built from the worktree with `rojo build` (code only); `play restart` rebuilds it"
+        if cloud:
+            out["cloud_place"] = cloud
         if group.place_id != "0":
             out["warning"] = (f"the server runs as place {group.place_id}: DataStores are that universe's live data "
                               "(players are UserId -1, -2, ...)")
@@ -567,15 +599,78 @@ class Pool:
         """Launches the test server with one client, maps both to their Studio MCP ids, then adds the rest one by
         one (a launch at a time, so each new MCP id belongs to a known process)."""
         g = slot.group
-        g.windows.clear()
-        g.client_cmdline = None
-        g.next_instance = 0
         t0 = time.time()
         self._copy_place(slot, g.template)
+        for attempt in range(1, GROUP_LAUNCH_TRIES + 1):
+            g.windows.clear()
+            g.client_cmdline = None
+            g.next_instance = 0
+            try:
+                server_id, client_id, client_pid = self._launch_server(slot, t0)
+                break
+            except PlaceCollision as e:
+                kill_tree(slot.proc)
+                if attempt == GROUP_LAUNCH_TRIES:
+                    raise PoolError(f"{e} ({attempt} tries)") from e
+                slot.event("launch", f"{e}; relaunching", notice=True)
+        tag = f"{slot.n}-{secrets.token_hex(3)}"
+        self._luau_retry(server_id, "Server", f'workspace:SetAttribute("{GROUP_ATTR}", "{tag}") '
+                         f'game:GetService("CoreGui"):SetAttribute("{MARKER_ATTR}", {slot.n})', t0)
+        g.windows[SERVER] = Window(SERVER, server_id, slot.proc.pid, slot.proc)
+        self._install_capture(slot, g.windows[SERVER])
+        name = self._client_name(client_id, tag, t0)
+        g.windows[name] = Window(name, client_id, client_pid)
+        self._install_capture(slot, g.windows[name])
+        g.tag = tag
+        log.info("slot %d: test server + %s up in %.0fs", slot.n, name, time.time() - t0)
+        for _ in range(clients - 1):
+            self._add_client(slot)
+        slot.state = "ready"
+
+    def _wait_place_quiet(self, slot):
+        """Waits until TEST_SERVER_PLACE has been untouched for PLACE_QUIET_SECS, so a person's Clients and Servers
+        test that just wrote it has already been read by its server."""
+        t0 = time.time()
+        told = False
+        while True:
+            try:
+                age = time.time() - TEST_SERVER_PLACE.stat().st_mtime
+            except FileNotFoundError:
+                return
+            if age >= PLACE_QUIET_SECS:
+                return
+            if time.time() - t0 > PLACE_QUIET_WAIT:
+                raise PoolError(f"{TEST_SERVER_PLACE} kept changing for {PLACE_QUIET_WAIT}s (another Studio keeps "
+                                "starting Clients and Servers tests)")
+            if not told:
+                slot.event("launch", f"another Studio wrote {TEST_SERVER_PLACE.name} {age:.0f}s ago; waiting")
+                told = True
+            time.sleep(min(PLACE_QUIET_SECS - age, 2) + 0.1)
+
+    def _server_log(self, slot):
+        """The launched test server's Studio log: the newest log since the launch whose command line names this
+        slot's place copy."""
+        needle = slot.file_copy.as_posix()
+        for f in sorted(STUDIO_LOGS.glob("*.log"), key=lambda f: f.stat().st_mtime, reverse=True)[:20]:
+            try:
+                if f.stat().st_mtime < slot.launched_at - 5:
+                    break
+                head = f.read_text(errors="replace")[:20000]
+            except OSError:
+                continue
+            if "-task StartServer" in head and needle in head:
+                return f
+        return None
+
+    def _launch_server(self, slot, t0):
+        """Writes the place to TEST_SERVER_PLACE, launches the test server and waits for it and its first client in
+        the Studio MCP. Raises PlaceCollision if another Studio replaced the file before the server had read it."""
+        g = slot.group
         cmd = [str(studio_exe()), "-task", "StartServer", "-localProjectFile", slot.file_copy.as_posix(),
                "-placeId", g.place_id, "-universeId", g.universe_id, "-port", "0", "-creatorId", "0",
                "-creatorType", "0", "-placeVersion", "0", "-numTestServerPlayersUponStartup", "1"]
         with self.launch_lock:
+            self._wait_place_quiet(slot)
             before = {s["id"] for s in self.mcp.list_studios()}
             # the server loads TEST_SERVER_PLACE, not -localProjectFile (kept: it names the place in the window)
             shutil.copyfile(slot.file_copy, TEST_SERVER_PLACE)
@@ -586,7 +681,21 @@ class Pool:
             self._save_pids()
             server_id = client_id = client_pid = None
             classified = set()
+            server_log, read = None, False
+
+            def check_place():
+                now = TEST_SERVER_PLACE.stat()
+                if (now.st_size, now.st_mtime_ns) != (placed.st_size, placed.st_mtime_ns):
+                    raise PlaceCollision(f"another Studio replaced {TEST_SERVER_PLACE.name} before the test server "
+                                         "read it")
+
             while not (server_id and client_id and client_pid):
+                if not read:
+                    # its server DataModel exists once the place file is read; a change after that is harmless
+                    server_log = server_log or self._server_log(slot)
+                    if server_log and "StudioGameStateType_PlayServer" in server_log.read_text(errors="replace"):
+                        check_place()
+                        read = True
                 if slot.proc.poll() is not None:
                     raise PoolError(f"test server exited during launch ({slot.proc.returncode})")
                 if slot.state == "closing":
@@ -612,23 +721,11 @@ class Pool:
                     if focus:
                         classified.add(s["id"])
                 time.sleep(1)
-            now = TEST_SERVER_PLACE.stat()
-            if (now.st_size, now.st_mtime_ns) != (placed.st_size, placed.st_mtime_ns):
-                # another Studio started a Clients and Servers test while ours was loading
-                raise PoolError(f"{TEST_SERVER_PLACE} was replaced while the test server loaded it; try again")
-        tag = f"{slot.n}-{secrets.token_hex(3)}"
-        self._luau_retry(server_id, "Server", f'workspace:SetAttribute("{GROUP_ATTR}", "{tag}") '
-                         f'game:GetService("CoreGui"):SetAttribute("{MARKER_ATTR}", {slot.n})', t0)
-        g.windows[SERVER] = Window(SERVER, server_id, slot.proc.pid, slot.proc)
-        self._install_capture(slot, g.windows[SERVER])
-        name = self._client_name(client_id, tag, t0)
-        g.windows[name] = Window(name, client_id, client_pid)
-        self._install_capture(slot, g.windows[name])
-        g.tag = tag
-        log.info("slot %d: test server + %s up in %.0fs", slot.n, name, time.time() - t0)
-        for _ in range(clients - 1):
-            self._add_client(slot)
-        slot.state = "ready"
+            if not read:
+                # no log line seen (log not found or format changed): fall back to "unchanged until up"
+                log.warning("slot %d: no place-read line in the test server log (%s)", slot.n, server_log)
+                check_place()
+        return server_id, client_id, client_pid
 
     def _focus(self, studio_id):
         """'Server' or 'Client' for a test window (the DataModel its viewport shows), 'Edit' for an edit Studio."""
@@ -1583,6 +1680,29 @@ def print_tools(tools, name):
         print(f"{t['name']}({args}){denied}\n    {(t.get('description') or '').strip().splitlines()[0][:160]}")
 
 
+def cloud_key(op):
+    """Runs locally (not through the daemon): the daemon reads the keychain itself on each cloud acquire."""
+    if op == "set":
+        if sys.stdin.isatty():
+            import getpass
+            key = getpass.getpass("Roblox Open Cloud API key (input hidden): ")
+        else:
+            key = sys.stdin.readline()
+        key = key.strip()
+        if not key:
+            fail("no key given")
+        cloudplace.set_key(key)
+        print(f"stored in the OS keychain ({cloudplace.KEYRING_SERVICE} / {cloudplace.KEYRING_USER})")
+    elif op == "clear":
+        print("removed" if cloudplace.clear_key() else "no key was stored")
+    else:
+        try:
+            key, source = cloudplace.api_key()
+        except cloudplace.CloudPlaceError as e:
+            fail(str(e))
+        print(f"key found in {source} ({len(key)} chars)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1590,7 +1710,8 @@ def main():
     s.add_argument("--cap", type=int, default=3)
     a = sub.add_parser("acquire")
     a.add_argument("--worktree", help="repo to sync; alone, it also builds a local template from the project")
-    a.add_argument("--place-file", help="template .rbxl; each slot opens its own throwaway copy")
+    a.add_argument("--place-file", help="template .rbxl, or cloud:<placeId> (downloaded, cached by version); each "
+                                        "slot opens its own throwaway copy")
     a.add_argument("--place")
     a.add_argument("--universe")
     a.add_argument("--mount", action="append", default=[], metavar="NAME=DIR",
@@ -1667,10 +1788,15 @@ def main():
     sh.add_argument("--target", help="multi-client lease: server (default), PlayerN")
     sub.add_parser("hide", help="switch back to your desktop")
     sub.add_parser("shutdown", help="close every pool Studio and stop the daemon")
+    ck = sub.add_parser("cloud-key", help="the Roblox API key for --place-file cloud:<id>, in the OS keychain: "
+                                          "set | status | clear")
+    ck.add_argument("op", choices=["set", "status", "clear"])
     args = ap.parse_args()
 
     if args.cmd == "serve":
         return serve(args.cap)
+    if args.cmd == "cloud-key":
+        return cloud_key(args.op)
     if args.cmd == "acquire":
         out = request("POST", "/acquire", {
             "place": args.place, "universe": args.universe, "place_file": args.place_file,
