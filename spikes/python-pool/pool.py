@@ -57,9 +57,9 @@ def kill_tree(proc):
 class StudioMcp:
     """Minimal MCP stdio client: newline-delimited JSON-RPC."""
 
-    def __init__(self):
+    def __init__(self, command=None):
         self.proc = subprocess.Popen(
-            ["cmd", "/c", str(MCP_BAT)],
+            command or ["cmd", "/c", str(MCP_BAT)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
