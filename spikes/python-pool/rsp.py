@@ -198,7 +198,7 @@ class Group:
     """A Clients and Servers test: a test server started from a place file, which starts the first client itself;
     the pool adds the others by copying that client's command line (server port + the server's transport token)."""
     template: Path  # the place file each launch copies
-    place_id: str = "0"  # --place/--universe: the server runs as that place (live DataStores)
+    place_id: str = "0"  # from group_ids: non-zero means the server runs as that place (live DataStores)
     universe_id: str = "0"
     spec: repo.RepoSpec | None = None  # set when the template was built from a worktree (rebuilt on restart)
     windows: dict = field(default_factory=dict)  # target -> Window
@@ -553,25 +553,24 @@ class Pool:
 
     def _acquire_group(self, clients, place_file, worktree, place, universe, client, wait):
         """A test server plus `clients` players, started from a place file (or a `rojo build` of the worktree)
-        without an edit Studio. --place/--universe are only ever taken from the caller: they make the server run as
-        that place, with that universe's live DataStores."""
+        without an edit Studio. The server runs as the place `group_ids` picks (--place/--universe, else the
+        worktree's pool.toml, as for a single lease), with that universe's live DataStores."""
         if clients < 1:
             raise PoolError("--clients must be at least 1 (the pool learns the server's port from the first client)")
-        if bool(place) != bool(universe):
-            raise PoolError("pass both --place and --universe, or neither")
-        spec = cloud = None
+        repo_spec = load_spec(worktree) if worktree else None
+        place, universe = group_ids(place, universe, repo_spec)
+        spec = cloud = None  # spec stays None for a saved template: nothing to rebuild
         if place_file:
             template, cloud = self._place_file(place_file)
-        elif worktree:
-            spec = load_spec(worktree)
-            if spec.template:
-                template, cloud = self._place_file(spec.template)
-                spec = None  # a saved template, nothing to rebuild
+        elif repo_spec:
+            if repo_spec.template:
+                template, cloud = self._place_file(repo_spec.template)
             else:
+                spec = repo_spec
                 template = self._build_template(spec)
         else:
             raise PoolError("a multi-client test needs --place-file or --worktree")
-        group = Group(template, str(place or 0), str(universe or 0), spec)
+        group = Group(template, place, universe, spec)
         slot, lease, _ = self._take_slot(f"{GROUP_PREFIX}{template}", "", False, True, client, wait,
                                          weight=1 + clients)
         slot.group = group
@@ -1508,6 +1507,22 @@ def load_spec(worktree):
         return repo.load(worktree)
     except repo.RepoError as e:
         raise PoolError(str(e)) from e
+
+
+def group_ids(place, universe, spec):
+    """(place id, universe id) a multi-client test server runs as: the caller's pair, else the pair in the
+    worktree's pool.toml, else 0/0 (no place: DataStores off)."""
+    if bool(place) != bool(universe):
+        raise PoolError("pass both --place and --universe, or neither")
+    if place:
+        return str(place), str(universe)
+    if spec and (spec.place or spec.universe):
+        if not (spec.place and spec.universe):
+            missing = "universe" if spec.place else "place"
+            raise PoolError(f"{spec.root / repo.SPEC_DIR / repo.SPEC_FILE} does not set `{missing}`: a multi-client "
+                            "test needs both `place` and `universe` there, or --place and --universe")
+        return spec.place, spec.universe
+    return "0", "0"
 
 
 def describe_watch(watch):

@@ -43,7 +43,7 @@ rsp acquire --place-file cloud:PLACE_ID --clients 2 --client <your-name>   # the
 - Point commands at a window with `--target server|Player1|…` (default `server`): `luau`, `logs`, `wait-log`, `call`, `show`. `logs` and `wait-log` also take `--target all`. `--dm` doesn't apply.
 - Players come and go mid-test: `rsp clients LEASE add [N]` (joins in ~10s), `rsp clients LEASE remove Player2 --kick` (a clean leave; `PlayerRemoving` within ~1s), or without `--kick` (kills the client like a crash; the server notices only after its ~60s timeout). Player names are never reused: after Player2 leaves, the next joiner is Player3 or later. `rsp clients LEASE list` shows who's in.
 - Players are test accounts with UserId -1, -2, … in join order, and each joiner gets a new one. To test "save, leave, rejoin, load": save as Player1, then `play restart` or acquire a new test: Player1 is -1 again.
-- `game.PlaceId` is 0 and DataStores are off, unless you pass `--place P --universe U`: the server then runs as that place against **that universe's live DataStores**. Only do that when asked.
+- The server runs as the place in `--place P --universe U`, else as `place`/`universe` from the `--worktree`'s `pool.toml` (same as a single lease, also when you pass `--place-file`). It then works against **that universe's live DataStores**, and the acquire result has a `warning` saying so: read it. Only pass `--place`/`--universe` yourself when asked. With neither source (no `--worktree`, or a `pool.toml` without ids), `game.PlaceId` is 0 and DataStores are off.
 - Killing the server skips `game:BindToClose` (and `game:Shutdown()` does nothing in a test server), so code that saves on shutdown doesn't run on release.
 
 Things that work differently in a multi-client test:
