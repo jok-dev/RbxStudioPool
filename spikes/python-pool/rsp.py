@@ -48,7 +48,7 @@ import pool
 import repo
 from pool import MARKER_ATTR, TEAM_CREATE_PROBE, StudioMcp, kill_tree, port_open, studio_exe
 
-HOST, PORT = "127.0.0.1", 7811
+HOST, PORT = "127.0.0.1", int(os.environ.get("RSP_PORT", 7811))  # RSP_PORT: a second daemon beside the usual one
 STATE = Path(__file__).parent / "state"
 CLOUD_PLACES = STATE / "cloud-places"  # cloudplace.fetch cache: <placeId>/<version>.rbxl
 LEASE_TTL = int(os.environ.get("RSP_LEASE_TTL", 600))
@@ -90,6 +90,13 @@ GROUP_PREFIX = "group:"
 GROUP_ATTR = "RspGroup"  # workspace attribute the server sets; replicates to its clients, so they can be told apart
 ROJO_BASE_PORT = 34900
 LEVELS = ["output", "info", "warning", "error"]
+MODES = ("play", "server-only")
+RUN_MODE_START_TIMEOUT = 60
+# Starts Studio's Run mode (a playtest with a server and no client) from the Edit DataModel. The call only returns
+# when the run ends, so it gets its own thread. Studio then reports Play mode with a Server DataModel, exactly as
+# for Play, and start_stop_play stops it and restores the place.
+START_RUN_MODE = ('task.spawn(function() game:GetService("StudioTestService"):ExecuteRunModeAsync({}) end) '
+                  'return "started"')
 
 # Installs (once per DataModel) a LogService capture as _G.RspLogs, then queries it. Not capped by the
 # 512-entry LogService history, and filtered/grouped in Studio so a flood of one error stays one line.
@@ -228,6 +235,7 @@ class Slot:
     watcher: threading.Event | None = None  # set to stop the slot's watcher
     restart_on_code: bool = False  # restart a running playtest when the worktree's code changes
     playing: bool = False  # last play state set through the pool
+    play_mode: str | None = None  # which of MODES is running (kept during a restart); None when stopped
     play_lock: threading.Lock = field(default_factory=threading.Lock)  # held by start/stop/restart
     restarting: bool = False
     activity: float = 0.0  # last time the watcher saw a change or finished acting on one
@@ -1054,10 +1062,18 @@ class Pool:
 
     # --- play ---
 
-    def play(self, lease_id, op, wait=None, timeout=120):
+    def play(self, lease_id, op, wait=None, timeout=120, mode="play"):
         """start | stop | status | wait. start/stop wait for the mode change; start can also wait for a Server log
-        line. wait returns once file changes have been acted on (restart finished, hooks/commands run)."""
+        line. wait returns once file changes have been acted on (restart finished, hooks/commands run).
+        mode (start only): "play", or "server-only" for a server with no client."""
         lease, slot = self.lease(lease_id)
+        if mode not in MODES:
+            raise PoolError(f"mode must be one of {list(MODES)}")
+        if op == "start" and mode == "server-only":
+            if slot.group:
+                raise PoolError("server-only is for single-Studio leases; a multi-client test always has clients")
+            if slot.team_create:
+                raise PoolError("server-only is not available on a Team Create slot")
         if slot.group:
             if op == "status":
                 return {"mode": "multi-client test", "restarting": slot.restarting, **self._group_status(slot),
@@ -1080,26 +1096,37 @@ class Pool:
             raise PoolError(f"unknown play op {op}")
         start = op == "start"
         with slot.play_lock:
+            if start and slot.play_mode and "server-only" in (mode, slot.play_mode):
+                raise PoolError(f"a {slot.play_mode} playtest is running: stop first")
             t0 = time.time()
-            self._start_stop(slot, start)
+            self._start_stop(slot, start, mode)
             took = round(time.time() - t0, 1)
         out = {**self._play_status(slot), "took": took}
         if start and wait:
             out["matched"] = self.wait_log(lease_id, wait, "Server", timeout)
         return out
 
-    def _start_stop(self, slot, start):
-        """Under slot.play_lock."""
-        self.mcp.call("start_stop_play", {"is_start": start, "studio_id": slot.studio_id}, timeout=120)
+    def _start_stop(self, slot, start, mode="play", keep_mode=False):
+        """Under slot.play_lock. mode only matters for a start: start_stop_play stops either mode.
+        keep_mode: this stop is the first half of a restart, which starts again in the same mode."""
+        if start and mode == "server-only":
+            self.mcp.luau(slot.studio_id, START_RUN_MODE, datamodel="Edit", timeout=60)
+            self._wait_mode(slot, "Play", RUN_MODE_START_TIMEOUT)
+        else:
+            self.mcp.call("start_stop_play", {"is_start": start, "studio_id": slot.studio_id}, timeout=120)
         slot.playing = start
         if start:
-            for dm in ("Server", "Client"):  # capture logs from the start, before a flood can push them out
+            slot.play_mode = mode
+            # capture logs from the start, before a flood can push them out. A server-only run has no client.
+            for dm in ("Server", "Client") if mode == "play" else ("Server",):
                 try:
                     self._query_logs(slot, dm, {"since": 1e9, "limit": 0}, retry_for=30)
                 except Exception as e:
                     slot.event("logs", f"could not start log capture in {dm}: {e}", notice=True)
             self._connect_play_server(slot)
         else:
+            if not keep_mode:
+                slot.play_mode = None
             self._wait_mode(slot, "Edit", 30)
 
     def _wait_mode(self, slot, mode, timeout):
@@ -1122,7 +1149,7 @@ class Pool:
             mode = mode.group(1) if mode else text.strip()
         except Exception as e:
             mode = f"unknown ({e})"
-        return {"mode": mode, "playing": slot.playing, "restarting": slot.restarting,
+        return {"mode": mode, "playing": slot.playing, "play_mode": slot.play_mode, "restarting": slot.restarting,
                 "new_events": self._new_events(slot)}
 
     def _new_events(self, slot):
@@ -1149,12 +1176,16 @@ class Pool:
         t0 = time.time()
         try:
             with slot.play_lock:
+                if not slot.playing:  # stopped while this restart waited for the lock
+                    return
+                mode = slot.play_mode or "play"
                 time.sleep(1.5)  # let Rojo sync the change into the Edit DataModel the next Play copies
-                self._start_stop(slot, False)
-                self._start_stop(slot, True)
+                self._start_stop(slot, False, keep_mode=True)
+                self._start_stop(slot, True, mode)
             slot.event("restart", f"playtest restarted in {time.time() - t0:.1f}s")
         except Exception as e:
             slot.playing = False
+            slot.play_mode = None
             slot.event("restart", f"playtest restart failed after {time.time() - t0:.0f}s: {e}. "
                                   "Check `play status`; if Studio is stuck, release with --close.", notice=True)
         finally:
@@ -1470,7 +1501,7 @@ class Pool:
                 "slots": [{
                     "slot": s.n, "place": s.place, "state": s.state, "team_create": s.team_create,
                     "pid": s.proc.pid if s.proc else None, "studio_id": s.studio_id, "worktree": s.worktree,
-                    "lease": s.lease, "playing": s.playing, "restarting": s.restarting,
+                    "lease": s.lease, "playing": s.playing, "play_mode": s.play_mode, "restarting": s.restarting,
                     "client": self.leases[s.lease].client if s.lease in self.leases else None,
                     "idle_for": None if s.lease else round(now - s.idle_since),
                     "last_event": s.events[-1] if s.events else None,
@@ -1583,7 +1614,8 @@ def make_handler(p: Pool):
                 "/acquire": lambda: p.acquire(**body),
                 "/sync": lambda: p.sync(body["lease"], body["worktree"], body.get("mounts")),
                 "/call": lambda: p.call(body["lease"], body["tool"], body.get("args"), body.get("target")),
-                "/play": lambda: p.play(body["lease"], body["op"], body.get("wait"), body.get("timeout", 120)),
+                "/play": lambda: p.play(body["lease"], body["op"], body.get("wait"), body.get("timeout", 120),
+                                        body.get("mode", "play")),
                 "/logs": lambda: p.logs(body["lease"], body.get("dm"), body.get("level", "output"), body.get("grep"),
                                         body.get("since", 0), body.get("limit", 200), body.get("group", True),
                                         body.get("exclude"), body.get("all", False), body.get("target")),
@@ -1757,6 +1789,9 @@ def main():
                          "restart: relaunch a multi-client test (rebuilt from the worktree if it was built)")
     pl.add_argument("--wait", metavar="REGEX", help="after start, wait for a Server log line matching this")
     pl.add_argument("--timeout", type=int, default=120)
+    pl.add_argument("--mode", choices=MODES, default="play",
+                    help="start only. server-only: a server with no client (no LocalPlayer, character or UI); "
+                         "adds about half the memory Play does")
     lg = sub.add_parser("logs", help="captured log lines, repeats grouped")
     lg.add_argument("lease")
     lg.add_argument("--dm", choices=["Edit", "Server", "Client"], help="default: Edit, or Server while playing")
@@ -1838,7 +1873,7 @@ def main():
         return
     elif args.cmd == "play":
         out = request("POST", "/play", {"lease": args.lease, "op": args.op, "wait": args.wait,
-                                        "timeout": args.timeout})
+                                        "timeout": args.timeout, "mode": args.mode})
     elif args.cmd == "logs":
         out = request("POST", "/logs", {"lease": args.lease, "dm": args.dm, "level": args.level, "grep": args.grep,
                                         "since": args.since, "limit": args.limit, "group": not args.no_group,

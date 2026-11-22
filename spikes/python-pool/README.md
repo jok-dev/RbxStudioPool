@@ -15,6 +15,7 @@ python rsp.py acquire --worktree DIR --place PLACE_ID --universe UNIVERSE_ID    
 python rsp.py acquire ... --mount config=C:/path/to/config         # source for a mount the repo's pool.toml declares
 python rsp.py acquire ... --restart-on-code                         # code edits during Play restart the playtest
 python rsp.py play <lease> start --wait "REGEX" | stop | status     # status includes pool events (restarts, hooks)
+python rsp.py play <lease> start --mode server-only                 # a server with no client: about half the memory of Play
 python rsp.py logs <lease> [--dm Server|Client|Edit] [--level warning] [--grep RE] [--since CURSOR]
 python rsp.py wait-log <lease> "REGEX" [--dm D] [--timeout 60] [--new]
 python rsp.py luau <lease> "return #workspace:GetChildren()" [--dm Server] | --file f.luau | -
@@ -43,6 +44,7 @@ Requires the RojoControl plugin fork (see `rojo-plugin/README.md`). `RSP_LEASE_T
 - `--place-file cloud:<placeId>` (or `template = "cloud"` in `pool.toml`, which downloads its `place`): the pool downloads the place through the Open Cloud Asset Delivery API (`GET apis.roblox.com/asset-delivery-api/v1/assetId/{id}` → `location` CDN URL, maybe gzip) into `state/cloud-places/<id>/`, then runs it like any other `--place-file`, multi-client tests included. Each acquire makes one small API call; the file downloads again only when the CDN path in `location` changes (a new place version). Older versions are deleted once no slot uses them. The copy's `PlaceId`/`GameId` are still 0 unless `--place`/`--universe` or `pool.toml` set them. That holds for multi-client tests too (`rsp.group_ids`, tests in `test_group_ids.py`): the caller's pair, else `pool.toml`'s, and the acquire result warns about live DataStores. Code is in `cloudplace.py`, tests in `test_cloudplace.py` (`python -m unittest test_cloudplace`).
   - **API key:** a user-owned Open Cloud key with the `legacy-asset:manage` scope, from an account that can open the place (create.roblox.com/dashboard/credentials). Community reports say group-owned keys are refused by this endpoint, so a group's place needs a member's personal key. `rsp.py cloud-key set` stores it in the OS keychain (Windows Credential Manager, `rbx-studio-pool` / `roblox-api-key`); `ROBLOX_API_KEY` in the daemon's environment overrides it. The daemon reads it per acquire and never logs it.
 - A deny list (`DENIED_TOOLS`) blocks tools that reach other Studios or write to the Roblox account (`upload_image`, `generate_*`, `create_skill`/`edit_skill`, `segment_mesh`, `subagent`).
+- `play start --mode server-only` starts Studio's Run mode with `StudioTestService:ExecuteRunModeAsync({})` from the Edit DataModel. Studio reports it as Play with a Server DataModel and no client, so stop, logs, `--wait`, hooks and `--restart-on-code` work as for Play. Not offered on multi-client or Team Create leases. `RunService:Run()` was tried first and rejected: stopping it doesn't restore the place (FINDINGS.md, Spike 5). Tests in `test_play.py`.
 - Pool pids are written to `state/pids.json`; a restarted daemon kills what a crashed one left behind.
 
 ## Findings (2026-10-30, measured on one dev machine)

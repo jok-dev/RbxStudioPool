@@ -173,6 +173,6 @@ Check it worked:
 
 These come from Spike 5 and aren't Linux-specific:
 
-- **Stop the embedded browser after the place loads.** Killing every `msedgewebview2.exe` belonging to a Studio saved 2.5–3.3 GB per Studio. The start page, Toolbox and Assistant stop working until Studio restarts. Don't do it before login or during launch.
-- **Use Run mode for server-only playtests.** `game:GetService("RunService"):Run()` from `execute_luau` on the Edit DataModel, then `:Stop()`. About 1.3 GB less than Play, with no client.
+- **Stop the embedded browser after the place loads (Linux).** Killing every `msedgewebview2.exe` belonging to a Studio saved 2.5–3.3 GB per Studio under Wine. On Windows a pool Studio has no browser processes, and a hand-opened one has about 0.3 GB of them. The start page, Toolbox and Assistant stop working until Studio restarts. Don't do it before login or during launch.
+- **Use Run mode for server-only playtests.** `game:GetService("StudioTestService"):ExecuteRunModeAsync({})` in its own thread from `execute_luau` on the Edit DataModel, stopped with `start_stop_play`. No client, and about half the memory Play adds. Don't use `RunService:Run()`: it adds no memory, but `:Stop()` doesn't put the place back.
 - **Restart Studios that have done many playtests.** Each Play start/stop leaves about 45 MB behind.
