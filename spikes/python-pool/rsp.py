@@ -44,6 +44,7 @@ from pathlib import Path
 
 import cloudplace
 import desktop
+import memory
 import pool
 import repo
 from pool import MARKER_ATTR, TEAM_CREATE_PROBE, StudioMcp, kill_tree, port_open, studio_exe
@@ -53,6 +54,10 @@ STATE = Path(__file__).parent / "state"
 CLOUD_PLACES = STATE / "cloud-places"  # cloudplace.fetch cache: <placeId>/<version>.rbxl
 LEASE_TTL = int(os.environ.get("RSP_LEASE_TTL", 600))
 IDLE_TTL = int(os.environ.get("RSP_IDLE_TTL", 900))
+# A Studio is worn after this many playtests, or this much memory growth since it was first ready. 0 turns one
+# off. A worn Studio is never closed while leased: its lease gets one notice, and it is replaced at release.
+WORN_PLAYS = int(os.environ.get("RSP_WORN_PLAYS", 40))
+WORN_GROWTH_MB = int(os.environ.get("RSP_WORN_GROWTH_MB", 1500))
 VISIBLE = os.environ.get("RSP_VISIBLE") == "1"  # launch Studios on the user's desktop (they will take focus)
 PIDS = STATE / "pids.json"
 AUTOSAVES = Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "RobloxStudio" / "AutoSaves"
@@ -238,6 +243,13 @@ class Slot:
     play_mode: str | None = None  # which of MODES is running (kept during a restart); None when stopped
     play_lock: threading.Lock = field(default_factory=threading.Lock)  # held by start/stop/restart
     restarting: bool = False
+    plays: int = 0  # playtests started on this Studio through the pool, in either mode
+    # The Studio's private bytes that growth is measured from: when it was first ready, then moved to after its
+    # first playtest, which leaves a one-off (about 0.5 GB on a small place) that is not wear.
+    baseline_mb: float | None = None
+    baselined_after_play: bool = False
+    memory_mb: float | None = None  # its private bytes when last read in Edit (never during a playtest)
+    wear_noticed: bool = False  # this lease has been told the Studio is worn
     activity: float = 0.0  # last time the watcher saw a change or finished acting on one
     events: collections.deque = field(default_factory=lambda: collections.deque(maxlen=30))
     event_count: int = 0
@@ -331,6 +343,8 @@ class Pool:
             if not reuse:
                 self._launch(slot, allow_team_create=team_create)
             synced = self.sync(lease.id, worktree, mounts) if worktree else None
+            if not reuse:  # after the place has loaded and synced, so neither counts as growth
+                slot.baseline_mb = slot.memory_mb = self._private_mb(slot)
         except Exception:
             self.release(lease.id, close=True)
             raise
@@ -405,6 +419,7 @@ class Pool:
             lease = Lease(secrets.token_hex(4), slot.n, client)
             slot.lease = lease.id
             slot.notices.clear()
+            slot.wear_noticed = False
             self.leases[lease.id] = lease
         for e in evict:
             self._close(e, "evicted for a new launch")
@@ -432,7 +447,7 @@ class Pool:
         if not fresh:
             for s in sorted(self.slots.values(), key=lambda s: s.idle_since):
                 if s.lease is None and s.state == "ready" and s.group is None and s.place == place \
-                        and (team_create or not s.team_create):
+                        and (team_create or not s.team_create) and not self._worn(s):
                     return s, [], True
         evict = self._evict_for(weight)
         if evict is None:
@@ -492,7 +507,39 @@ class Pool:
         # e.g. "- Current Studio Mode: Edit\n- Available DataModels: Edit\n- Focused DataModel in the viewport: Edit"
         if "Current Studio Mode: Edit" not in text:
             return f"not in edit mode ({text.strip().splitlines()[0] if text.strip() else '?'})"
-        return None
+        worn = self._check_wear(slot, notify=False)
+        return f"long use ({worn})" if worn else None
+
+    # --- wear ---
+
+    def _private_mb(self, slot):
+        try:
+            return memory.private_mb(slot.proc.pid)
+        except Exception:
+            return None
+
+    def _worn(self, slot):
+        """Why the slot counts as worn, from its playtest count and last memory reading, or None."""
+        known = slot.memory_mb is not None and slot.baseline_mb is not None
+        return memory.worn_reason(slot.plays, slot.memory_mb - slot.baseline_mb if known else None,
+                                  WORN_PLAYS, WORN_GROWTH_MB)
+
+    def _check_wear(self, slot, notify=True):
+        """Returns why the Studio is worn, or None. Reads its memory first, but only in Edit: a playtest's own
+        memory would look like growth, so during one the last Edit reading stands. The first time a lease's Studio
+        is worn, the lease gets one notice. Never closes anything and never raises."""
+        if slot.group or slot.proc is None or slot.proc.poll() is not None:
+            return None
+        if not (slot.playing or slot.restarting):
+            now = self._private_mb(slot)
+            if now is not None:
+                slot.memory_mb = now
+        reason = self._worn(slot)
+        if reason and notify and slot.lease and not slot.wear_noticed:
+            slot.wear_noticed = True
+            slot.event("wear", f"this Studio has had long use ({reason}). For a fresh one, release and acquire again "
+                               "when convenient. Nothing will be closed while you hold it.", notice=True)
+        return reason
 
     # --- Studio lifecycle ---
 
@@ -1117,6 +1164,7 @@ class Pool:
         slot.playing = start
         if start:
             slot.play_mode = mode
+            slot.plays += 1
             # capture logs from the start, before a flood can push them out. A server-only run has no client.
             for dm in ("Server", "Client") if mode == "play" else ("Server",):
                 try:
@@ -1128,6 +1176,12 @@ class Pool:
             if not keep_mode:
                 slot.play_mode = None
             self._wait_mode(slot, "Edit", 30)
+            if not keep_mode:
+                if not slot.baselined_after_play:
+                    after_first = self._private_mb(slot)
+                    if after_first is not None:
+                        slot.baseline_mb, slot.baselined_after_play = after_first, True
+                self._check_wear(slot)
 
     def _wait_mode(self, slot, mode, timeout):
         deadline = time.time() + timeout
@@ -1182,6 +1236,7 @@ class Pool:
                 time.sleep(1.5)  # let Rojo sync the change into the Edit DataModel the next Play copies
                 self._start_stop(slot, False, keep_mode=True)
                 self._start_stop(slot, True, mode)
+                self._check_wear(slot)  # restarts count as playtests, and may be the only ones this lease does
             slot.event("restart", f"playtest restarted in {time.time() - t0:.1f}s")
         except Exception as e:
             slot.playing = False
@@ -1505,6 +1560,9 @@ class Pool:
                     "client": self.leases[s.lease].client if s.lease in self.leases else None,
                     "idle_for": None if s.lease else round(now - s.idle_since),
                     "last_event": s.events[-1] if s.events else None,
+                    "plays": s.plays, "memory_mb": None if s.memory_mb is None else round(s.memory_mb),
+                    "growth_mb": (None if s.memory_mb is None or s.baseline_mb is None
+                                  else round(s.memory_mb - s.baseline_mb)),
                     **({"studios": s.weight, "targets": [SERVER, *s.group.players()]} if s.group else {}),
                 } for s in sorted(self.slots.values(), key=lambda s: s.n)],
                 "studios_used": sum(s.weight for s in self.slots.values()),

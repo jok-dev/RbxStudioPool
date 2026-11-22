@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import memory
 import rsp
 
 EDIT_STATE = "- Current Studio Mode: Edit\n- Available DataModels: Edit"
@@ -82,6 +83,7 @@ class PoolFixture(unittest.TestCase):
         self.patch(self.pool, "_save_pids")
         self.patch(self.pool, "_copy_place")
         self.patch(rsp.time, "sleep")
+        self.patch(memory, "private_mb", return_value=None)  # never read a real process
 
     def patch(self, target, name, **kwargs):
         patcher = mock.patch.object(target, name, **kwargs)
