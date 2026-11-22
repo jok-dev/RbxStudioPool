@@ -20,7 +20,7 @@ class WornReason(unittest.TestCase):
         self.assertIsNone(memory.worn_reason(39, 100.0, 40, 1500))
 
     def test_growth_trips_it(self):
-        self.assertEqual(memory.worn_reason(3, 1638.4, 40, 1500), "grew 1.6 GB since launch")
+        self.assertEqual(memory.worn_reason(3, 1638.4, 40, 1500), "grew 1.6 GB in use")
         self.assertIsNone(memory.worn_reason(3, 1499.0, 40, 1500))
 
     def test_zero_turns_a_threshold_off(self):
@@ -93,11 +93,36 @@ class Wear(PoolFixture):
 
     def test_growth_alone_trips_the_notice(self):
         out = self.acquire()
+        self.patch(rsp, "WORN_PLAYS", new=0)
+        self.cycle(out["lease"])
         self.mb = 3600.0
         self.cycle(out["lease"])
         notices = self.wear_notices(out["lease"])
         self.assertEqual(len(notices), 1)
-        self.assertIn("grew 1.6 GB since launch", notices[0]["detail"])
+        self.assertIn("grew 1.6 GB in use", notices[0]["detail"])
+
+    def test_what_the_first_playtest_leaves_behind_is_not_growth(self):
+        # the first playtest costs a one-off that scales with the place; only what later ones add is wear
+        out = self.acquire()
+        self.patch(rsp, "WORN_PLAYS", new=0)
+        self.mb = 3600.0
+        self.cycle(out["lease"])
+        self.assertEqual(self.slot(out).baseline_mb, 3600.0)
+        self.mb = 3700.0
+        self.cycle(out["lease"])
+        self.assertEqual(self.slot(out).baseline_mb, 3600.0)
+        self.assertEqual(self.wear_notices(out["lease"]), [])
+        self.assertEqual(self.pool.release(out["lease"]), {"closed": False})
+
+    def test_restarts_on_code_alone_still_get_the_notice(self):
+        out = self.acquire()
+        slot = self.slot(out)
+        self.pool.play(out["lease"], "start")
+        self.pool._restart_play(slot, {("code", "a.luau")})
+        notices = self.wear_notices(out["lease"])
+        self.assertEqual(len(notices), 1)
+        self.assertIn("2 playtests", notices[0]["detail"])
+        self.assertEqual(self.closed, [])
 
     def test_memory_is_not_judged_during_play(self):
         out = self.acquire()
@@ -113,9 +138,10 @@ class Wear(PoolFixture):
         slot = self.slot(out)
         self.pool.play(out["lease"], "start")
         self.mb = 5000.0
+        self.patch(rsp, "WORN_PLAYS", new=0)
         self.pool._restart_play(slot, {("code", "a.luau")})
         self.assertEqual(slot.plays, 2)
-        self.assertEqual(slot.memory_mb, 2000.0)
+        self.assertEqual((slot.memory_mb, slot.baseline_mb), (2000.0, 2000.0))
         self.assertEqual(self.wear_notices(out["lease"]), [])
 
     def test_a_worn_slot_is_closed_at_release_for_long_use(self):
@@ -130,7 +156,7 @@ class Wear(PoolFixture):
         out = self.acquire()
         self.mb = 3600.0
         self.assertEqual(self.pool.release(out["lease"]), {"closed": True})
-        self.assertIn("long use (grew 1.6 GB since launch)", self.closed[0][1])
+        self.assertIn("long use (grew 1.6 GB in use)", self.closed[0][1])
 
     def test_an_unworn_slot_is_kept_warm(self):
         out = self.acquire()
@@ -185,10 +211,12 @@ class Wear(PoolFixture):
 
     def test_status_reports_wear(self):
         out = self.acquire()
+        self.patch(rsp, "WORN_PLAYS", new=0)
+        self.cycle(out["lease"])
         self.mb = 2300.0
         self.cycle(out["lease"])
         row = self.pool.status()["slots"][0]
-        self.assertEqual((row["plays"], row["memory_mb"], row["growth_mb"]), (1, 2300, 300))
+        self.assertEqual((row["plays"], row["memory_mb"], row["growth_mb"]), (2, 2300, 300))
 
 
 if __name__ == "__main__":

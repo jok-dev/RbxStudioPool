@@ -244,7 +244,10 @@ class Slot:
     play_lock: threading.Lock = field(default_factory=threading.Lock)  # held by start/stop/restart
     restarting: bool = False
     plays: int = 0  # playtests started on this Studio through the pool, in either mode
-    baseline_mb: float | None = None  # the Studio's private bytes when it was first ready
+    # The Studio's private bytes that growth is measured from: when it was first ready, then moved to after its
+    # first playtest, which leaves a one-off (about 0.5 GB on a small place) that is not wear.
+    baseline_mb: float | None = None
+    baselined_after_play: bool = False
     memory_mb: float | None = None  # its private bytes when last read in Edit (never during a playtest)
     wear_noticed: bool = False  # this lease has been told the Studio is worn
     activity: float = 0.0  # last time the watcher saw a change or finished acting on one
@@ -522,14 +525,15 @@ class Pool:
                                   WORN_PLAYS, WORN_GROWTH_MB)
 
     def _check_wear(self, slot, notify=True):
-        """Reads the Studio's memory and returns why it is worn, or None. Only in Edit: a playtest's own memory
-        would look like growth. The first time a lease's Studio is worn, the lease gets one notice. Never closes
-        anything and never raises."""
-        if slot.playing or slot.restarting or slot.group or slot.proc is None or slot.proc.poll() is not None:
+        """Returns why the Studio is worn, or None. Reads its memory first, but only in Edit: a playtest's own
+        memory would look like growth, so during one the last Edit reading stands. The first time a lease's Studio
+        is worn, the lease gets one notice. Never closes anything and never raises."""
+        if slot.group or slot.proc is None or slot.proc.poll() is not None:
             return None
-        now = self._private_mb(slot)
-        if now is not None:
-            slot.memory_mb = now
+        if not (slot.playing or slot.restarting):
+            now = self._private_mb(slot)
+            if now is not None:
+                slot.memory_mb = now
         reason = self._worn(slot)
         if reason and notify and slot.lease and not slot.wear_noticed:
             slot.wear_noticed = True
@@ -1172,7 +1176,12 @@ class Pool:
             if not keep_mode:
                 slot.play_mode = None
             self._wait_mode(slot, "Edit", 30)
-            self._check_wear(slot)
+            if not keep_mode:
+                if not slot.baselined_after_play:
+                    after_first = self._private_mb(slot)
+                    if after_first is not None:
+                        slot.baseline_mb, slot.baselined_after_play = after_first, True
+                self._check_wear(slot)
 
     def _wait_mode(self, slot, mode, timeout):
         deadline = time.time() + timeout
@@ -1227,6 +1236,7 @@ class Pool:
                 time.sleep(1.5)  # let Rojo sync the change into the Edit DataModel the next Play copies
                 self._start_stop(slot, False, keep_mode=True)
                 self._start_stop(slot, True, mode)
+                self._check_wear(slot)  # restarts count as playtests, and may be the only ones this lease does
             slot.event("restart", f"playtest restarted in {time.time() - t0:.1f}s")
         except Exception as e:
             slot.playing = False

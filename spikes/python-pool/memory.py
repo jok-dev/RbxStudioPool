@@ -44,10 +44,10 @@ def private_mb(pid):
 
 
 def worn_reason(plays, growth_mb, max_plays, max_growth_mb):
-    """Why a Studio counts as worn, or None. plays: playtests started on it. growth_mb: memory gained since it was
-    first ready (None if unknown, which only skips that check). A threshold of 0 is off."""
+    """Why a Studio counts as worn, or None. plays: playtests started on it. growth_mb: memory gained since its
+    baseline (None if unknown, which only skips that check). A threshold of 0 is off."""
     if max_plays and plays >= max_plays:
         return f"{plays} playtests"
     if max_growth_mb and growth_mb is not None and growth_mb >= max_growth_mb:
-        return f"grew {growth_mb / 1024:.1f} GB since launch"
+        return f"grew {growth_mb / 1024:.1f} GB in use"
     return None

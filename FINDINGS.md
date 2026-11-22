@@ -101,7 +101,7 @@ Measured 2026-11-21/22 on a Linux server (Ryzen 9700X, integrated Radeon GPU) ru
     | 7 | 3,755 MB | 3,360 MB |
     | 8 | 3,759 MB | 3,375 MB |
 
-    The first playtest adds about 520 MB that never comes back. After that the floor rises about 40 MB a cycle, close to the 45 MB under Wine. On this small place the pool's default growth limit (1,500 MB) would trip after about 25 playtests. A large game's one-off may be bigger: not measured.
+    The first playtest adds about 520 MB that never comes back. After that the floor rises about 40 MB a cycle, close to the 45 MB under Wine. A large game's one-off may be bigger (not measured), so the pool measures growth from after the first playtest. At 40 MB a cycle its default growth limit (1,500 MB) is reached after about 37 more, close to the default playtest limit of 40.
 - **No difference:**
   - Turning off script analysis ("Enable Script Analysis" in `GlobalSettings_13.xml`) made no measurable difference in Edit.
   - Stripping modules out of the playtest made Play and Run within 0.1 GB of the full run. This is game-specific anyway, and on a local file the game's boot didn't finish (no MemoryStoreService), so it isn't a fair test.
