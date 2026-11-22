@@ -88,6 +88,20 @@ Measured 2026-11-21/22 on a Linux server (Ryzen 9700X, integrated Radeon GPU) ru
     | `RunService:Run()` | about 0 | about 0 |
 
   - A Studio in Edit on this place used 2.2 GB working set and 2.7 GB private bytes.
+  - **Each Play leaves about 40 MB behind on Windows too, after a one-off 0.5 GB on the first.** Eight Play cycles on one fresh pool Studio, private bytes, read 10 s into each Play and 15 s after each stop (2,571 MB before the first):
+
+    | Cycle | During Play | After stop |
+    |---|---|---|
+    | 1 | 3,608 MB | 3,093 MB |
+    | 2 | 3,658 MB | 3,182 MB |
+    | 3 | 3,714 MB | 3,268 MB |
+    | 4 | 3,711 MB | 3,258 MB |
+    | 5 | 3,725 MB | 3,298 MB |
+    | 6 | 3,733 MB | 3,347 MB |
+    | 7 | 3,755 MB | 3,360 MB |
+    | 8 | 3,759 MB | 3,375 MB |
+
+    The first playtest adds about 520 MB that never comes back. After that the floor rises about 40 MB a cycle, close to the 45 MB under Wine. On this small place the pool's default growth limit (1,500 MB) would trip after about 25 playtests. A large game's one-off may be bigger: not measured.
 - **No difference:**
   - Turning off script analysis ("Enable Script Analysis" in `GlobalSettings_13.xml`) made no measurable difference in Edit.
   - Stripping modules out of the playtest made Play and Run within 0.1 GB of the full run. This is game-specific anyway, and on a local file the game's boot didn't finish (no MemoryStoreService), so it isn't a fair test.
@@ -96,7 +110,7 @@ Measured 2026-11-21/22 on a Linux server (Ryzen 9700X, integrated Radeon GPU) ru
 
 - **Stop the embedded browser after a slot is ready**, by default, **on Linux**. On Windows a pool Studio has none (see the Windows check), so the Python pool doesn't do this. Make it per-slot opt-out for leases that want the Toolbox or Assistant. Stop it only after the place has loaded and the Studio MCP sees the Studio, never during launch, because login and the first-run flow use it. A slot that had its browser stopped is marked so a lease asking for the Toolbox gets a fresh Studio.
 - **Offer a server-only playtest** (`play start --mode server-only`) next to Play, built on `StudioTestService:ExecuteRunModeAsync`, not `RunService:Run()`, which leaves the place changed. Default to Play so existing tests don't change behaviour. It adds about half the memory Play does.
-- **Recycle long-lived Studios.** Count playtests and track RSS per slot. Restart an idle slot once it passes a playtest count or a growth threshold since launch, both in config. With about 45 MB a cycle, 50 playtests is about 2 GB.
+- **Recycle long-lived Studios.** Count playtests and track memory per slot. Once a slot passes a playtest count or a growth threshold since launch, both in config, tell its lease once and replace the Studio when the lease is released. Never close a Studio an agent holds. With about 45 MB a cycle, 50 playtests is about 2 GB.
 - **On Linux, opt every Studio into samepage merging** and set `ksmd` to scan fast enough to matter (Spike 6 has how). Report the saving in `status`.
 - **Budget slots by measured memory, not a fixed cap.** The cost of a slot depends on the place, the mode, and how long it has lived. The pool already sees RSS, so it can refuse a lease or recycle a slot when free memory runs low, instead of a fixed `--cap`.
 

@@ -66,6 +66,7 @@ If the repo has one, read it: it tells you what the pool will do with your files
 ## Good to know
 
 - Problems the pool hits in the background (a failed restart or hook, log capture failing) come back as `notices` on your next command (on stderr for `luau`/`logs`). Read them.
+- A `wear` notice ("this Studio has had long use") means your Studio has run many playtests or grown a lot in memory. Nothing is closed while you hold the lease, so finish what you're doing. When it suits you, `rsp release LEASE` and acquire again to get a fresh Studio.
 - If `play start`/`stop` keeps failing with "Start play hasn't finished yet", the Studio is stuck: `rsp release LEASE --close` and acquire again.
 - Luau from `luau`/`execute_luau` gets its **own copy of required modules**: requiring a game module there doesn't show the game's state. Read Instances, attributes and logs instead.
 - Leases expire after 10 min without commands. Any command refreshes the lease.

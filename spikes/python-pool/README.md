@@ -31,7 +31,7 @@ python rsp.py play <lease> restart                                  # relaunch a
 
 Agents: see `SKILL.md`. To set a repo up for agents (its `pool.toml` plus a CLAUDE.md section pointing at `SKILL.md`), run `/setup-rbx-studio-pool` in that repo; install it with `cp -r skills/setup-rbx-studio-pool ~/.claude/skills/`. Per-repo behaviour (mounts, watch hooks, prepare commands) comes from the repo's `.rbx-studio-pool/pool.toml`; the format is in `repo.py`. Nothing game-specific is left in the pool: a game's local remote config is a `pool.toml` plus a hook in that game's repo.
 
-Requires the RojoControl plugin fork (see `rojo-plugin/README.md`). `RSP_LEASE_TTL` / `RSP_IDLE_TTL` (seconds) override the 600 / 900 defaults.
+Requires the RojoControl plugin fork (see `rojo-plugin/README.md`). `RSP_LEASE_TTL` / `RSP_IDLE_TTL` (seconds) override the 600 / 900 defaults. `RSP_WORN_PLAYS` (default 40 playtests) and `RSP_WORN_GROWTH_MB` (default 1500) set when a Studio counts as worn from long use; `0` turns one off. `RSP_PORT` moves the daemon off 7811, for a second daemon beside the usual one.
 
 ## What it does
 
@@ -45,6 +45,7 @@ Requires the RojoControl plugin fork (see `rojo-plugin/README.md`). `RSP_LEASE_T
   - **API key:** a user-owned Open Cloud key with the `legacy-asset:manage` scope, from an account that can open the place (create.roblox.com/dashboard/credentials). Community reports say group-owned keys are refused by this endpoint, so a group's place needs a member's personal key. `rsp.py cloud-key set` stores it in the OS keychain (Windows Credential Manager, `rbx-studio-pool` / `roblox-api-key`); `ROBLOX_API_KEY` in the daemon's environment overrides it. The daemon reads it per acquire and never logs it.
 - A deny list (`DENIED_TOOLS`) blocks tools that reach other Studios or write to the Roblox account (`upload_image`, `generate_*`, `create_skill`/`edit_skill`, `segment_mesh`, `subagent`).
 - `play start --mode server-only` starts Studio's Run mode with `StudioTestService:ExecuteRunModeAsync({})` from the Edit DataModel. Studio reports it as Play with a Server DataModel and no client, so stop, logs, `--wait`, hooks and `--restart-on-code` work as for Play. Not offered on multi-client or Team Create leases. `RunService:Run()` was tried first and rejected: stopping it doesn't restore the place (FINDINGS.md, Spike 5). Tests in `test_play.py`.
+- **Wear:** each playtest leaves about 40 MB in Studio that never comes back (FINDINGS.md, Spike 5). Each slot counts playtests and reads its Studio's private bytes when the acquire finishes, after each `play stop` and at release, never during a playtest. Past either limit the lease gets one notice and nothing is closed; at release the Studio is closed instead of kept warm, and a worn idle Studio is never reused. `status` shows `plays`, `memory_mb` and `growth_mb` per slot. Code in `memory.py`, tests in `test_memory.py`.
 - Pool pids are written to `state/pids.json`; a restarted daemon kills what a crashed one left behind.
 
 ## Findings (2026-10-30, measured on one dev machine)
