@@ -45,20 +45,26 @@ Three changes, one PR each.
 - The slot records that its browser was stopped. `_pick` doesn't hand such a warm slot to a `--keep-browser` lease, which gets a fresh Studio. A slot with its browser intact can serve either kind, and has its browser stopped when a lease without the flag takes it.
 - `status` shows the browser state per slot.
 - **Check first, on Windows:** the saving (it was 2.5–3.3 GB under Wine), that Studio doesn't respawn the browser, and that Edit, Play, Luau and Rojo keep working. If Studio respawns it, stop and rethink before building.
-- Multi-client groups: apply to the server and client windows only if the check shows they have browser processes. Otherwise leave them out.
+- The check must also show that stopping one Studio's browser leaves other Studios' browsers alone, including a Studio the user has open outside the pool.
+- Multi-client groups are left alone. They're always closed at release.
+- Failing to stop the browser never fails the acquire.
 
 ### 2. `play start --mode server-only`
 
 - `play LEASE start --mode server-only` runs `RunService:Run()` on the Edit DataModel through `execute_luau`, instead of `start_stop_play`. `--mode play` is the default and is today's behaviour.
 - The slot remembers which mode is running. `play stop` ends that one (`RunService:Stop()` for server-only). `play status` reports it.
 - `--wait REGEX` works as it does for Play.
-- Multi-client leases reject it with a clear error.
+- Multi-client leases and Team Create slots reject it with a clear error. Starting one mode while the other is running is rejected too.
+- Logs and `--wait` only see lines from the current run, not earlier runs on the same Studio.
+- A lease released while a run is going closes the Studio, as releasing mid-Play does today.
+- **Open until the Windows check:** whether stopping a server-only run puts the place back as it was. Under Wine it added almost no memory, which suggests it runs in the Edit DataModel with no copy to restore from. If the place isn't restored, the mode leaves each run's leftovers behind, and the user decides whether to drop it or ship it with the Studio always closed at release.
 - `--restart-on-code` restarts in the mode that was running.
 - **Check first, on Windows:** what `get_studio_state` reports as the mode during a server-only run, which DataModel name `execute_luau` and log capture need there, and whether the Rojo live sync and watch hooks attach the way they do to a Play server. The answers decide how `_start_stop`, `_wait_mode`, `_live_dm` and the release-time dirty check handle the mode. If log capture can't work in it, say so in the result rather than fail silently.
 
 ### 3. Wear tracking
 
-- Each slot counts playtests started through the pool (both modes) and records its Studio's memory when it first became ready. Memory is the working set of the Studio process, read on each `play stop` and by the reaper.
+- Each slot counts playtests started through the pool (both modes) and records its Studio's memory when it first became ready. Memory is the Studio process's private bytes, read after each `play stop` and at release, and recorded first when the acquire finishes (after the place has loaded and synced). It is never judged during a playtest, when a client's worth of extra memory would look like wear.
+- **Check first, on Windows:** repeat Spike 5's five-cycle table, since its numbers are from Wine, and confirm the defaults below don't trip early.
 - A slot is **worn** when playtests ≥ `RSP_WORN_PLAYS` (default 40) or growth since ready ≥ `RSP_WORN_GROWTH_MB` (default 1500). Either trips it. `0` turns a threshold off.
 - **During a lease:** when the slot becomes worn, one notice goes to the lease through the existing `notices` path, once per lease: how many playtests, how much growth, and that releasing and acquiring again gets a fresh Studio when convenient. Nothing is closed.
 - **At release:** worn is one more reason in `_dirty_reason`, so the Studio is closed instead of kept warm. The next acquire launches fresh.
