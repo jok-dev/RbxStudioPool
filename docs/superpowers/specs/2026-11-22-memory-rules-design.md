@@ -2,6 +2,16 @@
 
 Approved 2026-11-22. Builds on Spike 5 in [FINDINGS.md](../../../FINDINGS.md).
 
+## Revised after the Windows checks (2026-11-22)
+
+The checks this design asked for changed two of its three parts. Details are in the Windows check under Spike 5 in [FINDINGS.md](../../../FINDINGS.md).
+
+- **1. Stop the embedded browser: dropped from the Python pool.** A pool Studio on Windows has no browser processes, and a hand-opened Studio has about 0.3 GB of them. It stays a Linux item for the Rust backend.
+- **2. `--mode server-only`: built on `StudioTestService:ExecuteRunModeAsync`, not `RunService:Run()`.** `Run()` doesn't restore the place. The replacement does, and Studio treats it as a playtest with a Server DataModel, so `play stop`, logs, `--wait`, hooks and the release check work as they do for Play. It saves about half of what Play adds, not all of it.
+- **3. Wear tracking: unchanged.**
+
+The sections below are the design as first approved.
+
 ## Intent
 
 A pool-run Studio holds memory it doesn't need: an embedded browser, a client in playtests that only test the server, and growth left behind by each playtest. The pool should cut these on its own, so more Studios fit on one machine with no change to any game and nothing for an agent to remember.

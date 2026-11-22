@@ -76,14 +76,26 @@ Measured 2026-11-21/22 on a Linux server (Ryzen 9700X, integrated Radeon GPU) ru
   | 5 | 5.25 GB | 4.43 GB |
 
   The peak during Play doesn't grow, but the floor after each stop does, by about 45 MB a cycle. Clearing the Output window between cycles didn't stop it (it went 4.43 → 4.58 GB over the same five cycles). It isn't released back, so a long-lived Studio slowly grows.
+- **Windows check (2026-11-22, one dev machine, a small place from a local file, pool Studio on the hidden desktop).** Two of the three savings look different on Windows:
+  - **A pool Studio has no embedded browser.** Its only child process was the crash handler. A Studio opened by hand, with the start page shown and the Toolbox and Assistant panels open, had 7 `msedgewebview2.exe` processes using about 0.3 GB in total: six started with the start page, one more when a panel was opened. The pool opens Studio straight onto a place file, and Studios reuse the user's saved layout, which had those panels closed. So the browser only exists when one of those is on screen, and on Windows it is about a tenth of what it was under Wine.
+  - **`RunService:Run()` does not restore the place.** It ran the game in the Edit DataModel and added no memory, but after `RunService:Stop()` a part a script had created was still there, a part that had fallen stayed fallen, and an attribute a script had set stayed set. Scripts did run again on a second `Run()`. Each run would leave its leftovers for the next, so the pool can't offer it as a playtest.
+  - **`StudioTestService:ExecuteRunModeAsync({})` is a clean server-only playtest.** Called through `execute_luau` on the Edit DataModel, in its own thread because it only returns when the run ends. Studio reports Play mode with DataModels "Client, Server", but no client exists (0 players, the Client DataModel doesn't answer). The Server DataModel takes Luau and log capture as in Play. `start_stop_play` with `is_start` false stops it, and the place is back as it was before the run. Start took about 2 s.
+
+    | Mode | Working set added | Private bytes added |
+    |---|---|---|
+    | Play | +0.6 to 0.8 GB | about +0.9 GB |
+    | `ExecuteRunModeAsync` | +0.33 GB | +0.34 GB |
+    | `RunService:Run()` | about 0 | about 0 |
+
+  - A Studio in Edit on this place used 2.2 GB working set and 2.7 GB private bytes.
 - **No difference:**
   - Turning off script analysis ("Enable Script Analysis" in `GlobalSettings_13.xml`) made no measurable difference in Edit.
   - Stripping modules out of the playtest made Play and Run within 0.1 GB of the full run. This is game-specific anyway, and on a local file the game's boot didn't finish (no MemoryStoreService), so it isn't a fair test.
 
 **Design impact:**
 
-- **Stop the embedded browser after a slot is ready**, by default. Make it per-slot opt-out for leases that want the Toolbox or Assistant. Stop it only after the place has loaded and the Studio MCP sees the Studio, never during launch, because login and the first-run flow use it. A slot that had its browser stopped is marked so a lease asking for the Toolbox gets a fresh Studio.
-- **Offer Run mode as a playtest option** (`play start --mode run`) next to Play. Default to Play so existing tests don't change behaviour. Its memory cost is close to nothing, so a server-only test fits several to a machine.
+- **Stop the embedded browser after a slot is ready**, by default, **on Linux**. On Windows a pool Studio has none (see the Windows check), so the Python pool doesn't do this. Make it per-slot opt-out for leases that want the Toolbox or Assistant. Stop it only after the place has loaded and the Studio MCP sees the Studio, never during launch, because login and the first-run flow use it. A slot that had its browser stopped is marked so a lease asking for the Toolbox gets a fresh Studio.
+- **Offer a server-only playtest** (`play start --mode server-only`) next to Play, built on `StudioTestService:ExecuteRunModeAsync`, not `RunService:Run()`, which leaves the place changed. Default to Play so existing tests don't change behaviour. It adds about half the memory Play does.
 - **Recycle long-lived Studios.** Count playtests and track RSS per slot. Restart an idle slot once it passes a playtest count or a growth threshold since launch, both in config. With about 45 MB a cycle, 50 playtests is about 2 GB.
 - **On Linux, opt every Studio into samepage merging** and set `ksmd` to scan fast enough to matter (Spike 6 has how). Report the saving in `status`.
 - **Budget slots by measured memory, not a fixed cap.** The cost of a slot depends on the place, the mode, and how long it has lived. The pool already sees RSS, so it can refuse a lease or recycle a slot when free memory runs low, instead of a fixed `--cap`.
