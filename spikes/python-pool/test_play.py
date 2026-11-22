@@ -194,6 +194,18 @@ class PlayModes(PoolFixture):
         self.assertEqual(self.mcp.play_calls(), ["server-only", "stop"])
         self.assertIsNone(self.the_slot.play_mode)
 
+    def test_a_stop_that_races_a_restart_still_clears_the_mode(self):
+        # the watcher sets `restarting` before it gets the play lock; the agent's stop can hold the lock then
+        self.pool.play(self.lease, "start", mode="server-only")
+        self.the_slot.restarting = True
+        self.pool.play(self.lease, "stop")
+        self.assertIsNone(self.the_slot.play_mode)
+        self.pool._restart_play(self.the_slot, {("code", "a.luau")})
+        self.assertEqual(self.mcp.play_calls(), ["server-only", "stop"])
+        self.assertIsNone(self.the_slot.play_mode)
+        self.pool.play(self.lease, "start")
+        self.assertEqual(self.the_slot.play_mode, "play")
+
     def test_a_failed_restart_leaves_no_mode_behind(self):
         self.pool.play(self.lease, "start", mode="server-only")
         self.mcp.run_mode_starts = False

@@ -1106,8 +1106,9 @@ class Pool:
             out["matched"] = self.wait_log(lease_id, wait, "Server", timeout)
         return out
 
-    def _start_stop(self, slot, start, mode="play"):
-        """Under slot.play_lock. mode only matters for a start: start_stop_play stops either mode."""
+    def _start_stop(self, slot, start, mode="play", keep_mode=False):
+        """Under slot.play_lock. mode only matters for a start: start_stop_play stops either mode.
+        keep_mode: this stop is the first half of a restart, which starts again in the same mode."""
         if start and mode == "server-only":
             self.mcp.luau(slot.studio_id, START_RUN_MODE, datamodel="Edit", timeout=60)
             self._wait_mode(slot, "Play", RUN_MODE_START_TIMEOUT)
@@ -1124,7 +1125,7 @@ class Pool:
                     slot.event("logs", f"could not start log capture in {dm}: {e}", notice=True)
             self._connect_play_server(slot)
         else:
-            if not slot.restarting:
+            if not keep_mode:
                 slot.play_mode = None
             self._wait_mode(slot, "Edit", 30)
 
@@ -1179,7 +1180,7 @@ class Pool:
                     return
                 mode = slot.play_mode or "play"
                 time.sleep(1.5)  # let Rojo sync the change into the Edit DataModel the next Play copies
-                self._start_stop(slot, False)
+                self._start_stop(slot, False, keep_mode=True)
                 self._start_stop(slot, True, mode)
             slot.event("restart", f"playtest restarted in {time.time() - t0:.1f}s")
         except Exception as e:
